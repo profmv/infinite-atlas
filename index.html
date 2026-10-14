@@ -1,0 +1,689 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="description" content="Endless zoom through an ever-new procedural atlas of nebulae, terrain, rivers, cells, stars and snow crystals.">
+<title>Infinite Atlas</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant:wght@300;500&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+  /* Layout: full-bleed WebGL canvas, cartographic readout top-left, glass control bar pinned bottom. */
+  :root {
+    --ink: #eef2f6;
+    --ink-dim: #9aa6b4;
+    --glass: rgba(10, 13, 18, 0.6);
+    --edge: rgba(200, 214, 230, 0.16);
+    --accent: #f0c27a;
+    --void: #05070b;
+    color-scheme: dark;
+    --display: "Cormorant", "Iowan Old Style", Georgia, serif;
+    --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  }
+
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--void);
+    color: var(--ink);
+    overflow: hidden;
+    font-family: var(--mono);
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  #stage { position: fixed; inset: 0; display: block; width: 100%; height: 100%; background: var(--void); }
+
+  #fallback {
+    position: fixed; inset: 0;
+    display: grid; place-content: center;
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+    text-align: center; color: var(--ink-dim); font-size: 13px; line-height: 1.6;
+  }
+
+  /* ---- readout ---- */
+  #readout {
+    position: fixed;
+    top: env(safe-area-inset-top, 0px);
+    left: 0; right: 0;
+    padding-block: 18px;
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+    pointer-events: none;
+    display: grid; gap: 6px;
+    transition: opacity 700ms ease;
+  }
+  #readout h1 {
+    margin: 0;
+    font-family: var(--display);
+    font-weight: 300;
+    font-size: clamp(22px, 4.6vw, 32px);
+    letter-spacing: 0.03em;
+    text-wrap: balance;
+    color: var(--ink);
+    text-shadow: 0 1px 14px rgba(0, 0, 0, 0.8);
+  }
+  .meta {
+    margin: 0;
+    font-size: 11px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--ink-dim);
+    font-variant-numeric: tabular-nums;
+    text-shadow: 0 1px 10px rgba(0, 0, 0, 0.85);
+  }
+  .meta b { font-weight: 500; color: var(--ink); }
+
+  /* ---- control bar ---- */
+  #bar {
+    position: fixed; left: 0; right: 0; bottom: 0;
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    background: linear-gradient(to top, rgba(5, 7, 11, 0.78), rgba(5, 7, 11, 0));
+    transition: opacity 700ms ease;
+  }
+  #bar .inner {
+    display: flex; align-items: center; gap: 14px;
+    flex-wrap: wrap;
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+    padding-block: 16px 20px;
+    max-width: 980px; margin: 0 auto;
+    background: var(--glass);
+    -webkit-backdrop-filter: blur(14px); backdrop-filter: blur(14px);
+    border-top: 1px solid var(--edge);
+  }
+  @media (min-width: 620px) {
+    #bar .inner { border: 1px solid var(--edge); border-radius: 14px; margin-bottom: 16px; padding-block: 14px; }
+  }
+
+  label[for="speed"] {
+    font-size: 10px; letter-spacing: 0.16em; text-transform: uppercase;
+    color: var(--ink-dim); white-space: nowrap;
+  }
+  #speed {
+    flex: 1 1 180px; min-width: 0;
+    accent-color: var(--accent);
+    height: 22px; cursor: ew-resize;
+  }
+  #rate {
+    font-size: 12px; font-variant-numeric: tabular-nums;
+    color: var(--ink); min-width: 10.5ch; text-align: right; white-space: nowrap;
+  }
+  button {
+    font-family: var(--mono); font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--ink); background: rgba(240, 194, 122, 0.1);
+    border: 1px solid var(--edge); border-radius: 8px;
+    padding: 8px 12px; cursor: pointer;
+    transition: background 180ms ease, border-color 180ms ease;
+  }
+  button:hover { background: rgba(240, 194, 122, 0.2); border-color: rgba(240, 194, 122, 0.5); }
+  #hint {
+    flex: 0 0 100%; margin: 0;
+    font-size: 10px; letter-spacing: 0.1em; color: var(--ink-dim);
+  }
+
+  :is(button, input, a):focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+  .veiled { opacity: 0; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+
+<div id="readout">
+  <h1>Infinite Atlas</h1>
+  <p class="meta" id="scale">charting</p>
+  <p class="meta" id="strata"></p>
+</div>
+
+<div id="bar">
+  <div class="inner">
+    <label for="speed">Zoom speed</label>
+    <input id="speed" type="range" min="0" max="1000" step="1" value="250" aria-describedby="rate">
+    <span id="rate">&mdash;</span>
+    <button id="reseed" type="button">New world</button>
+    <p id="hint">Space pauses the descent &middot; R charts a new world</p>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  var canvas = document.getElementById("stage");
+  var gl = canvas.getContext("webgl2", { antialias: false, alpha: false, powerPreference: "high-performance" });
+
+  if (!gl) {
+    canvas.remove();
+    var f = document.createElement("div");
+    f.id = "fallback";
+    f.textContent = "This animation needs WebGL2, which this browser did not provide.";
+    document.body.appendChild(f);
+    document.getElementById("bar").remove();
+    return;
+  }
+
+  /* ------------------------------------------------------------------ *
+   * How the endless map works.
+   *
+   * The view is a stack of N octave layers, each twice as fine as the
+   * one above it. Every layer owns its own coordinate frame (offset and
+   * rotation, kept in JS doubles), its own pattern family and its own
+   * hue. Zooming in slides every layer towards the coarse end; when the
+   * coarsest layer has grown past the screen it is retired and a brand
+   * new, randomly generated layer is born at the fine end. Nothing is
+   * ever reused, so the descent keeps revealing new structure, and no
+   * coordinate the shader sees ever grows large enough to lose float
+   * precision.
+   * ------------------------------------------------------------------ */
+
+  var N = 7;           // live octave layers
+  var BASE_FREQ = 3.0; // features per screen unit at u = 0
+
+  var FAMILIES = ["nebula", "relief", "rivers", "tissue", "starfield", "crystals", "currents"];
+
+  var VERT = [
+    "#version 300 es",
+    "void main() {",
+    "  vec2 p = vec2((gl_VertexID == 1) ? 3.0 : -1.0, (gl_VertexID == 2) ? 3.0 : -1.0);",
+    "  gl_Position = vec4(p, 0.0, 1.0);",
+    "}"
+  ].join("\n");
+
+  var FRAG = [
+    "#version 300 es",
+    "precision highp float;",
+    "#define N " + N,
+    "#define TAU 6.283185307179586",
+    "out vec4 fragColor;",
+    "uniform vec2 uRes;",
+    "uniform float uTime, uFade, uF, uBgHue;",
+    "uniform float uU[N];",
+    "uniform vec2 uC[N];",
+    "uniform vec2 uR[N];",
+    "uniform float uFam[N];",
+    "uniform float uSeed[N];",
+    "uniform float uHue[N];",
+    "",
+    "float hash12(vec2 p){ vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }",
+    "vec2 hash22(vec2 p){ vec3 p3 = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973)); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.xx + p3.yz) * p3.zy); }",
+    "",
+    "float gnoise(vec2 p){",
+    "  vec2 i = floor(p), f = fract(p);",
+    "  vec2 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);",
+    "  float va = dot(hash22(i) * 2.0 - 1.0, f);",
+    "  float vb = dot(hash22(i + vec2(1.0, 0.0)) * 2.0 - 1.0, f - vec2(1.0, 0.0));",
+    "  float vc = dot(hash22(i + vec2(0.0, 1.0)) * 2.0 - 1.0, f - vec2(0.0, 1.0));",
+    "  float vd = dot(hash22(i + vec2(1.0, 1.0)) * 2.0 - 1.0, f - vec2(1.0, 1.0));",
+    "  return mix(mix(va, vb, u.x), mix(vc, vd, u.x), u.y) * 1.6;",
+    "}",
+    "float fbm3(vec2 p){",
+    "  float s = 0.0, a = 0.5;",
+    "  for (int i = 0; i < 3; i++) { s += a * gnoise(p); p = mat2(1.6, 1.2, -1.2, 1.6) * p + 11.7; a *= 0.5; }",
+    "  return s;",
+    "}",
+    "",
+    "mat2 rot(float a){ float c = cos(a), s = sin(a); return mat2(c, s, -s, c); }",
+    "float sdSeg(vec2 p, vec2 a, vec2 b){ vec2 pa = p - a, ba = b - a; float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0); return length(pa - ba * h); }",
+    "float sdHex(vec2 p, float r){ p = abs(p); return max(p.x * 0.8660254 + p.y * 0.5, p.y) - r; }",
+    "",
+    "vec3 hue3(float h){ return 0.5 + 0.5 * cos(TAU * (h + vec3(0.0, 0.333, 0.667))); }",
+    "// t runs from shadow (0) to highlight (1) inside one hue family.",
+    "vec3 pal(float h, float t){",
+    "  vec3 c = hue3(h + 0.12 * t);",
+    "  float l = dot(c, vec3(0.299, 0.587, 0.114));",
+    "  c = mix(vec3(l), c, 0.72);",
+    "  return c * (0.08 + 1.05 * t);",
+    "}",
+    "",
+    "vec3 voro(vec2 x, out vec2 id, out vec2 rc){",
+    "  vec2 n = floor(x), f = fract(x);",
+    "  float d1 = 8.0, d2 = 8.0;",
+    "  id = n; rc = vec2(0.0);",
+    "  for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {",
+    "    vec2 g = vec2(float(i), float(j));",
+    "    vec2 r = g + 0.1 + 0.8 * hash22(n + g) - f;",
+    "    float d = dot(r, r);",
+    "    if (d < d1) { d2 = d1; d1 = d; id = n + g; rc = r; } else if (d < d2) { d2 = d; }",
+    "  }",
+    "  return vec3(sqrt(d1), sqrt(d2), 0.0);",
+    "}",
+    "",
+    "float flake(vec2 p, float k, float br, float ang){",
+    "  float seg = TAU / k;",
+    "  float a = atan(p.y, p.x), r = length(p);",
+    "  a = abs(mod(a + seg * 0.5, seg) - seg * 0.5);",
+    "  p = vec2(cos(a), sin(a)) * r;",
+    "  float d = sdSeg(p, vec2(0.0), vec2(1.0, 0.0));",
+    "  vec2 bd = vec2(cos(ang), sin(ang));",
+    "  for (int j = 0; j < 3; j++) {",
+    "    float fj = float(j);",
+    "    vec2 o = vec2(0.28 + 0.24 * fj, 0.0);",
+    "    d = min(d, sdSeg(p, o, o + bd * br * (1.0 - 0.28 * fj)));",
+    "  }",
+    "  return min(d, abs(sdHex(p, 0.16)));",
+    "}",
+    "",
+    "// One octave of the atlas. x is in the layer's own units (~1 feature",
+    "// per unit), px is layer units per screen pixel, fillW says how much",
+    "// of the layer's ground fill to show (only once it is large).",
+    "vec4 layer(int fam, vec2 x, float seed, float hue, float px, float fillW, float strW){",
+    "  vec2 p = x + seed * vec2(13.7, 7.3);",
+    "  float mask = smoothstep(-0.12, 0.22, gnoise(p * 0.17 + seed));",
+    "  vec3 c; float st = 0.0, fl = 0.0;",
+    "",
+    "  if (fam == 0) {",
+    "    // nebula: domain-warped gas with bright ionisation fronts",
+    "    vec2 q = vec2(fbm3(p * 0.8), fbm3(p * 0.8 + vec2(5.2, 1.3)));",
+    "    float n = fbm3(p * 0.8 + 2.4 * q + vec2(0.015 * uTime, 0.0));",
+    "    float dens = smoothstep(-0.3, 0.6, n);",
+    "    float fil = pow(clamp(1.0 - abs(n - 0.2) * 4.0, 0.0, 1.0), 4.0);",
+    "    c = pal(hue + 0.2 * q.x, 0.2 + 0.7 * dens) + pal(hue + 0.3, 1.0) * fil * 0.5;",
+    "    fl = 0.9 * dens;",
+    "    st = 0.6 * fil;",
+    "  } else if (fam == 1) {",
+    "    // relief: coastline, sea depth and contour lines of a terrain",
+    "    float h = fbm3(p * 0.55) + 0.35 * fbm3(p * 1.7 + 3.1);",
+    "    float sea = (fract(seed * 0.37) - 0.5) * 0.25;",
+    "    float aah = fwidth(h) * 1.5 + 1e-4;",
+    "    float land = smoothstep(sea - aah, sea + aah, h);",
+    "    float ci = h * 7.0;",
+    "    float cw = fwidth(ci) + 1e-4;",
+    "    float contour = 1.0 - smoothstep(0.5 * cw, 1.5 * cw, abs(fract(ci + 0.5) - 0.5));",
+    "    float coast = 1.0 - smoothstep(aah, 3.0 * aah, abs(h - sea));",
+    "    vec3 ocean = pal(hue + 0.5, 0.15 + 0.35 * smoothstep(sea - 0.5, sea, h));",
+    "    vec3 earth = pal(hue, 0.35 + 0.6 * smoothstep(sea, sea + 0.6, h));",
+    "    c = mix(ocean, earth, land);",
+    "    c = mix(c, pal(hue + 0.08, 1.0), contour * 0.45 * land);",
+    "    c = mix(c, pal(hue + 0.15, 1.15), coast * 0.8);",
+    "    fl = 0.92;",
+    "    st = max(contour * 0.45 * land, coast);",
+    "  } else if (fam == 2) {",
+    "    // rivers, leaf veins, lightning: ridges of warped noise",
+    "    vec2 w = p * 0.7 + 0.9 * vec2(fbm3(p * 0.35), fbm3(p * 0.35 + 4.1));",
+    "    float n1 = gnoise(w), n2 = gnoise(w * 2.3 + 1.7);",
+    "    float r1 = 1.0 - smoothstep(0.0, fwidth(n1) * 1.2 + 0.025, abs(n1));",
+    "    float r2 = (1.0 - smoothstep(0.0, fwidth(n2) * 1.2 + 0.015, abs(n2))) * (1.0 - smoothstep(0.0, 0.4, abs(n1)));",
+    "    float halo = exp(-abs(n1) * 9.0);",
+    "    float k = clamp(r1 + 0.8 * r2 + 0.3 * halo, 0.0, 1.0);",
+    "    c = mix(pal(hue, 0.1), pal(hue, 1.0), k);",
+    "    fl = 0.4 + 0.3 * halo;",
+    "    st = k;",
+    "  } else if (fam == 3) {",
+    "    // tissue, cracked mud, basalt: Voronoi cells with nuclei",
+    "    vec2 id, rc;",
+    "    vec3 v = voro(p * 1.1, id, rc);",
+    "    float e = v.y - v.x;",
+    "    float h = hash12(id + seed);",
+    "    float ew = 0.05 + px * 1.8;",
+    "    float edge = 1.0 - smoothstep(ew * 0.5, ew, e);",
+    "    float nuc = (1.0 - smoothstep(0.07, 0.07 + px * 2.2, length(rc))) * step(0.35, h);",
+    "    vec3 body = pal(hue + 0.1 * h, 0.22 + 0.35 * h) * (0.6 + 0.4 * smoothstep(0.0, 0.4, e));",
+    "    c = mix(body, pal(hue + 0.05, 0.95), edge);",
+    "    c = mix(c, pal(hue + 0.45, 0.9), nuc);",
+    "    fl = 0.85;",
+    "    st = max(edge, nuc);",
+    "  } else if (fam == 4) {",
+    "    // starfield with the occasional spiral galaxy",
+    "    vec2 id, rc;",
+    "    voro(p * 1.4, id, rc);",
+    "    float h = hash12(id + seed), h2 = hash12(id * 1.37 + seed + 3.1);",
+    "    float pv = px * 1.4;",
+    "    float sz = max(pv * 1.4, 0.02);",
+    "    float b = pow(h, 4.0) * (0.75 + 0.25 * sin(uTime * 1.7 + h * 60.0));",
+    "    float star = b / (1.0 + dot(rc, rc) / (sz * sz));",
+    "    float gal = 0.0;",
+    "    if (h2 > 0.8) {",
+    "      vec2 g = rot(h * TAU) * rc;",
+    "      g.y *= 1.3 + 1.6 * fract(h2 * 7.0);",
+    "      float rr = length(g) / 0.42;",
+    "      float ga = atan(g.y, g.x);",
+    "      float spin = fract(h * 13.0) > 0.5 ? 1.0 : -1.0;",
+    "      float arms = 0.5 + 0.5 * cos(2.0 * ga - 5.5 * spin * log(rr + 0.02));",
+    "      gal = exp(-rr * 3.2) * (0.3 + 0.9 * arms * arms * arms) + 1.4 * exp(-rr * rr * 40.0);",
+    "      gal *= 1.0 - smoothstep(0.6, 1.1, rr);",
+    "    }",
+    "    float dust = smoothstep(0.0, 0.8, fbm3(p * 0.4));",
+    "    c = pal(hue + 0.55, 0.04 + 0.2 * dust) + pal(hue + 0.1 * h, 1.0) * star + pal(hue + 0.15, 0.9) * gal;",
+    "    fl = 0.55 + 0.3 * dust;",
+    "    st = clamp(star + gal, 0.0, 1.0);",
+    "  } else if (fam == 5) {",
+    "    // frost: snow crystals of varying symmetry scattered on ice",
+    "    vec2 id, rc;",
+    "    voro(p * 0.9, id, rc);",
+    "    float h = hash12(id + seed), h2 = hash12(id * 2.1 + seed);",
+    "    float k = h2 < 0.6 ? 6.0 : (h2 < 0.75 ? 12.0 : (h2 < 0.88 ? 8.0 : 5.0));",
+    "    float R = 0.22 + 0.2 * h;",
+    "    vec2 q = rot(h * TAU) * (-rc) / R;",
+    "    float d = flake(q, k, 0.3 + 0.25 * fract(h * 7.3), 0.85 + 0.4 * fract(h * 3.7)) * R / 0.9;",
+    "    float pv = px * 0.9;",
+    "    float w = 0.01 + pv * 0.6;",
+    "    float on = step(0.3, h);",
+    "    float core = (1.0 - smoothstep(w, w + pv * 1.5, d)) * on;",
+    "    float halo = exp(-d / (0.03 + pv * 2.0)) * 0.5 * on;",
+    "    float frost = smoothstep(0.0, 0.7, fbm3(p * 1.3));",
+    "    float k2 = clamp(core + halo, 0.0, 1.0);",
+    "    c = mix(pal(hue + 0.55, 0.1 + 0.22 * frost), pal(hue, 1.0), k2);",
+    "    fl = 0.5 + 0.3 * frost;",
+    "    st = k2;",
+    "  } else {",
+    "    // currents: banded flow, like gas-giant belts or wind on dunes",
+    "    vec2 w = p * 0.6 + 1.3 * vec2(fbm3(p * 0.3 + 1.0), fbm3(p * 0.3 + 5.7));",
+    "    float band = w.y * 1.8 + 1.2 * fbm3(w * 0.8);",
+    "    float bw = fwidth(band) + 1e-4;",
+    "    float s = 0.5 + 0.5 * sin(band * TAU);",
+    "    float line = 1.0 - smoothstep(0.6 * bw, 1.8 * bw + 0.01, abs(fract(band + 0.5) - 0.5));",
+    "    c = pal(hue + 0.08 * sin(band * 1.7), 0.22 + 0.55 * s);",
+    "    c = mix(c, pal(hue + 0.2, 1.0), line * 0.7);",
+    "    fl = 0.8;",
+    "    st = line * 0.7;",
+    "  }",
+    "",
+    "  // ground fills sit in shadow so the structures read above them",
+    "  c *= mix(0.5, 1.0, clamp(st, 0.0, 1.0));",
+    "  float a = clamp(st * strW * (0.15 + 0.85 * mask) + fl * fillW * mask, 0.0, 1.0);",
+    "  return vec4(c, a);",
+    "}",
+    "",
+    "void main(){",
+    "  float pxs = 2.0 / min(uRes.x, uRes.y);",
+    "  vec2 s = (gl_FragCoord.xy - 0.5 * uRes) * pxs;",
+    "  vec3 col = pal(uBgHue, 0.03);",
+    "  for (int k = 0; k < N; k++) {",
+    "    float u = uU[k];",
+    "    float scale = uF * exp2(u);",
+    "    float px = scale * pxs;",
+    "    // leave as the layer outgrows the screen, arrive gently at the",
+    "    // fine end, and never draw a layer whose features are sub-pixel",
+    "    float wt = smoothstep(-1.0, -0.4, u)",
+    "             * (1.0 - smoothstep(float(N) - 2.5, float(N) - 1.0, u))",
+    "             * (1.0 - smoothstep(0.05, 0.16, px));",
+    "    if (wt < 0.002) continue;",
+    "    vec2 x = mat2(uR[k].x, uR[k].y, -uR[k].y, uR[k].x) * (s * scale) + uC[k];",
+    "    // big layers carry the composition; fine ones only whisper detail",
+    "    float fillW = 1.0 - smoothstep(0.0, 1.6, u);",
+    "    float strW = 1.0 - 0.75 * smoothstep(0.4, 3.5, u);",
+    "    vec4 L = layer(int(uFam[k] + 0.5), x, uSeed[k], uHue[k], px, fillW, strW);",
+    "    col = mix(col, L.rgb, L.a * wt);",
+    "  }",
+    "  col *= 1.0 - 0.3 * smoothstep(0.6, 1.9, length(s));",
+    "  fragColor = vec4(pow(max(col, 0.0), vec3(0.95)) * uFade, 1.0);",
+    "}"
+  ].join("\n");
+
+  function compile(type, src) {
+    var sh = gl.createShader(type);
+    gl.shaderSource(sh, src);
+    gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+      throw new Error(gl.getShaderInfoLog(sh) || "shader compile failed");
+    }
+    return sh;
+  }
+
+  var prog = gl.createProgram();
+  gl.attachShader(prog, compile(gl.VERTEX_SHADER, VERT));
+  gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FRAG));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+    throw new Error(gl.getProgramInfoLog(prog) || "program link failed");
+  }
+  gl.useProgram(prog);
+
+  var U = {};
+  ["uRes", "uTime", "uFade", "uF", "uBgHue", "uU", "uC", "uR", "uFam", "uSeed", "uHue"].forEach(function (n) {
+    U[n] = gl.getUniformLocation(prog, n);
+  });
+
+  /* ------------------------------------------------------------------ *
+   * Layers.
+   * ------------------------------------------------------------------ */
+
+  var levels = new Map();
+  var depth = 0; // continuous zoom depth, in octaves (one octave = 2x)
+
+  function newLevel(L) {
+    var prev = levels.get(L - 1), prev2 = levels.get(L - 2);
+    var fam;
+    do { fam = Math.floor(Math.random() * FAMILIES.length); }
+    while ((prev && fam === prev.fam) || (prev2 && fam === prev2.fam));
+    // Hue takes a random walk from one octave to the next, with the
+    // occasional leap into a new colour world.
+    var hue = prev ? prev.hue + (Math.random() - 0.5) * 0.2 : Math.random();
+    if (prev && Math.random() < 0.15) hue += 0.25 + Math.random() * 0.5;
+    hue -= Math.floor(hue);
+    var ang = Math.random() * Math.PI * 2;
+    return {
+      fam: fam, seed: Math.random() * 64, hue: hue,
+      cs: Math.cos(ang), sn: Math.sin(ang),
+      cx: 16 + Math.random() * 96, cy: 16 + Math.random() * 96
+    };
+  }
+
+  function syncLevels() {
+    var n = Math.floor(depth);
+    levels.forEach(function (_, L) { if (L < n) levels.delete(L); });
+    for (var L = n; L < n + N; L++) {
+      if (!levels.has(L)) levels.set(L, newLevel(L));
+    }
+  }
+
+  // Move the camera by (dx, dy) screen units: every layer shifts by the
+  // same screen distance, expressed in its own rotated, scaled frame.
+  function pan(dx, dy) {
+    levels.forEach(function (lv, L) {
+      var sc = BASE_FREQ * Math.pow(2, L - depth);
+      lv.cx += (lv.cs * dx - lv.sn * dy) * sc;
+      lv.cy += (lv.sn * dx + lv.cs * dy) * sc;
+    });
+  }
+
+  /* ------------------------------------------------------------------ *
+   * State and controls.
+   * ------------------------------------------------------------------ */
+
+  var reduced = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  var speedEl = document.getElementById("speed");
+  var rateEl = document.getElementById("rate");
+  var scaleEl = document.getElementById("scale");
+  var strataEl = document.getElementById("strata");
+  var readoutEl = document.getElementById("readout");
+  var barEl = document.getElementById("bar");
+
+  if (reduced) { speedEl.value = "110"; }
+
+  var MAX_RATE = 0.8; // octaves per second at the top of the slider
+
+  var state = {
+    time: 0,
+    paused: false,
+    heading: Math.random() * Math.PI * 2,
+    fade: 1,
+    reseedT: -1 // progress of a "new world" transition, -1 when idle
+  };
+
+  function speed() {
+    if (state.paused) return 0;
+    var v = Number(speedEl.value) / 1000;
+    return v * v * MAX_RATE;
+  }
+
+  function showRate() {
+    var sp = speed();
+    if (sp <= 0.00001) { rateEl.textContent = state.paused ? "paused" : "frozen"; return; }
+    var perMin = Math.pow(2, sp * 60);
+    rateEl.textContent = (perMin < 10 ? perMin.toFixed(1) : perMin < 1e4 ? Math.round(perMin) : perMin.toExponential(1)) + "× / min";
+  }
+
+  function fmtMag(m) {
+    if (m < 1000) return m.toFixed(m < 10 ? 2 : 0);
+    var e = Math.floor(Math.log10(m));
+    return (m / Math.pow(10, e)).toFixed(1) + "e" + e;
+  }
+
+  function describe() {
+    var n = Math.floor(depth);
+    scaleEl.innerHTML = "Magnification <b>" + fmtMag(Math.pow(2, depth)) + "×</b> · octave <b>" + n + "</b>";
+    var names = [];
+    for (var L = n; L < n + N; L++) {
+      var u = L - depth;
+      if (u > -0.6 && u < 2.6) {
+        var name = FAMILIES[levels.get(L).fam];
+        if (names.indexOf(name) < 0) names.push(name);
+      }
+    }
+    strataEl.textContent = "Strata " + names.join(" › ");
+  }
+
+  speedEl.addEventListener("input", function () {
+    state.paused = false;
+    showRate();
+    wake();
+  });
+
+  function reseed() {
+    if (state.reseedT < 0) state.reseedT = 0;
+    wake();
+  }
+  document.getElementById("reseed").addEventListener("click", reseed);
+
+  window.addEventListener("keydown", function (e) {
+    if (e.code === "KeyR") { reseed(); return; }
+    if (e.code === "Space" && !(e.target && /^(INPUT|BUTTON|TEXTAREA)$/.test(e.target.tagName))) {
+      e.preventDefault();
+      state.paused = !state.paused;
+      showRate();
+      wake();
+    }
+  });
+
+  var idleTimer = 0;
+  function wake() {
+    readoutEl.classList.remove("veiled");
+    barEl.classList.remove("veiled");
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(function () {
+      if (barEl.contains(document.activeElement)) return;
+      readoutEl.classList.add("veiled");
+      barEl.classList.add("veiled");
+    }, 3600);
+  }
+  ["pointermove", "pointerdown", "wheel", "touchstart"].forEach(function (ev) {
+    window.addEventListener(ev, wake, { passive: true });
+  });
+  wake();
+
+  /* ------------------------------------------------------------------ *
+   * Sizing with adaptive resolution: if frames run slow the canvas
+   * renders at a lower internal scale and is stretched to fit.
+   * ------------------------------------------------------------------ */
+
+  var MAX_PIXELS = 2400 * 1350;
+  var renderScale = 1;
+
+  function resize() {
+    var dpr = Math.min(window.devicePixelRatio || 1, 2) * renderScale;
+    var w = Math.max(1, Math.floor(window.innerWidth * dpr));
+    var h = Math.max(1, Math.floor(window.innerHeight * dpr));
+    if (w * h > MAX_PIXELS) {
+      var k = Math.sqrt(MAX_PIXELS / (w * h));
+      w = Math.max(1, Math.floor(w * k));
+      h = Math.max(1, Math.floor(h * k));
+    }
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w;
+      canvas.height = h;
+      gl.viewport(0, 0, w, h);
+    }
+  }
+  window.addEventListener("resize", resize);
+  resize();
+
+  var perf = { acc: 0, frames: 0 };
+  function adapt(dt) {
+    perf.acc += dt; perf.frames++;
+    if (perf.acc < 1.5) return;
+    var ms = perf.acc / perf.frames * 1000;
+    perf.acc = 0; perf.frames = 0;
+    var next = renderScale;
+    if (ms > 30 && renderScale > 0.45) next = renderScale * 0.85;
+    else if (ms < 15 && renderScale < 1) next = Math.min(1, renderScale * 1.1);
+    if (next !== renderScale) { renderScale = next; resize(); }
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Frame loop.
+   * ------------------------------------------------------------------ */
+
+  var bufU = new Float32Array(N), bufC = new Float32Array(2 * N), bufR = new Float32Array(2 * N);
+  var bufFam = new Float32Array(N), bufSeed = new Float32Array(N), bufHue = new Float32Array(N);
+
+  function upload() {
+    var n = Math.floor(depth);
+    for (var k = 0; k < N; k++) {
+      var lv = levels.get(n + k);
+      bufU[k] = n + k - depth;
+      bufC[2 * k] = lv.cx; bufC[2 * k + 1] = lv.cy;
+      bufR[2 * k] = lv.cs; bufR[2 * k + 1] = lv.sn;
+      bufFam[k] = lv.fam; bufSeed[k] = lv.seed; bufHue[k] = lv.hue;
+    }
+    gl.uniform2f(U.uRes, canvas.width, canvas.height);
+    gl.uniform1f(U.uTime, state.time);
+    gl.uniform1f(U.uFade, state.fade);
+    gl.uniform1f(U.uF, BASE_FREQ);
+    gl.uniform1f(U.uBgHue, levels.get(n).hue + 0.55);
+    gl.uniform1fv(U.uU, bufU);
+    gl.uniform2fv(U.uC, bufC);
+    gl.uniform2fv(U.uR, bufR);
+    gl.uniform1fv(U.uFam, bufFam);
+    gl.uniform1fv(U.uSeed, bufSeed);
+    gl.uniform1fv(U.uHue, bufHue);
+  }
+
+  var last = 0, infoClock = 0;
+
+  function frame(now) {
+    var t = now * 0.001;
+    var dt = last ? Math.min(t - last, 0.1) : 0.016;
+    last = t;
+    state.time += dt;
+
+    var sp = speed();
+
+    // Slow wandering drift across the map while descending.
+    state.heading += (Math.sin(state.time * 0.031) * 0.6 + Math.sin(state.time * 0.017 + 1.3) * 0.4) * 0.08 * dt;
+    var v = 0.35 * sp * dt;
+    pan(Math.cos(state.heading) * v, Math.sin(state.heading) * v);
+
+    depth += sp * dt;
+    syncLevels();
+
+    if (state.reseedT >= 0) {
+      var before = state.reseedT;
+      state.reseedT = Math.min(1, state.reseedT + dt / 2.4);
+      if (before < 0.5 && state.reseedT >= 0.5) {
+        levels.clear();
+        syncLevels();
+      }
+      state.fade = 1 - 0.95 * Math.exp(-Math.pow((state.reseedT - 0.5) / 0.16, 2));
+      if (state.reseedT >= 1) { state.reseedT = -1; state.fade = 1; }
+    }
+
+    upload();
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    infoClock -= dt;
+    if (infoClock <= 0) { infoClock = 0.25; describe(); }
+    adapt(dt);
+
+    requestAnimationFrame(frame);
+  }
+
+  syncLevels();
+  describe();
+  showRate();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
