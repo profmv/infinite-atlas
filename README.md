@@ -14,9 +14,12 @@ remembered in the browser.
 
 | Model | What you see |
 | --- | --- |
-| Relief | A fractal coastline with hill-shaded land, sea and nested contour lines. The camera follows the coast, where detail never runs out. |
-| Relief + textures | The same world, with surface textures (nebulae, rivers, cells, stars, crystals, currents) drawn over the land and sea. |
-| Julia spiral | An exact, endless zoom into a Julia set around one of its fixed points. The picture repeats itself, turned, every time it grows by the multiplier. |
+| Relief | One fractal height field; coastline and contour lines are level sets that keep their shape and gain detail as you descend. |
+| Relief + textures | The same relief with surface texture families (nebula, rivers, tissue, starfield, crystals, currents...) running across octaves. |
+| Microscope | Nested layers of cells, one object per Voronoi cell (tissue with nuclei, round cells, diatoms with ribs and pore rings), shown through a round eyepiece in one of three stains (H&E, fluorescence, Giemsa). Finer layers only appear inside the room the coarser objects leave, and the camera steers away from the walls of big objects so they leave through the edge of the view. |
+| Cosmos | Nested layers of galaxies (spirals, ellipticals, coloured starbursts); an unresolved galaxy is a point of the same light that opens up as you approach. Finer galaxies follow the arms of coarser ones, and the camera climbs toward bright structure. |
+| Psychedelic | The same world as Relief, folded through a slowly turning kaleidoscope (5-9 mirrored wedges) and painted as flowing rainbow bands with glowing contour tiers. |
+| Julia spiral | Exact self-similar zoom via the Poincaré function of z² + c at a repelling fixed point. One zoom period is q iterations (abs(L)^q), so the q arms visibly zoom instead of mostly spinning. |
 
 ## Controls
 
@@ -47,9 +50,19 @@ field, so zooming only adds octaves; it never replaces what is there.
 - Contour tiers double in spacing, so every coarse line is also a line of the
   finer tiers: lines gain neighbours as you descend instead of vanishing.
 
+**Nested worlds (Microscope, Cosmos).** Every octave is a Voronoi layer fixed
+in its own frame. A layer's brightness is multiplied by the room left by the
+coarser layers (geometric weights), so detail appears inside what is already
+there instead of on top of it. Coarse layers fade only after their walls have
+left the screen.
+
+**Psychedelic.** It reuses the Relief field, so it has the same endless detail
+and only changes how the field is folded and coloured.
+
 **Julia spiral.** For f(z) = z² + c with a repelling fixed point and
 multiplier L, the Poincaré function P(w) satisfies P(Lw) = f(P(w)). Rendering P
-instead of the plane gives a seamless zoom that repeats every factor of |L|,
+instead of the plane gives a seamless zoom. One zoom period is q iterations
+(a factor of |L|^q), so the q arms visibly zoom instead of mostly spinning,
 using only small numbers on the GPU.
 
 The render resolution adapts if frames run slow.

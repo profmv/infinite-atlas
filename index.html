@@ -145,6 +145,9 @@
       <select id="model">
         <option value="relief">Relief</option>
         <option value="textured">Relief + textures</option>
+        <option value="microscope">Microscope</option>
+        <option value="cosmos">Cosmos</option>
+        <option value="psychedelic">Psychedelic</option>
         <option value="julia">Julia spiral</option>
       </select>
     </div>
@@ -205,7 +208,15 @@
   var COORD0 = 4096;        // layer frames live around here (keeps ints positive)
 
   var FAMILIES = ["nebula", "relief", "rivers", "tissue", "starfield", "crystals", "currents"];
-  var MODELS = { relief: "Relief", textured: "Relief + textures", julia: "Julia spiral" };
+  var MODELS = {
+    relief: "Relief", textured: "Relief + textures", microscope: "Microscope",
+    cosmos: "Cosmos", psychedelic: "Psychedelic", julia: "Julia spiral"
+  };
+  // Which engine drives each model: the relief field, nested levels, or the Julia map.
+  var ENGINE = {
+    relief: "field", textured: "field", psychedelic: "field",
+    microscope: "nest", cosmos: "nest", julia: "julia"
+  };
 
   var VERT = [
     "#version 300 es",
@@ -227,28 +238,9 @@
     "}"
   ].join("\n");
 
-  var FIELD_FRAG = [
-    "#version 300 es",
-    "precision highp float;",
-    "precision highp int;",
-    "#define N " + N,
-    "#define KF " + KF.toFixed(1),
-    "#define QA " + QA.toFixed(4),
-    COMMON,
-    "out vec4 fragColor;",
-    "uniform vec2 uRes;",
-    "uniform float uTime, uFade, uB, uLogA, uEfr, uTex;",
-    "uniform float uU[N];",
-    "uniform ivec2 uCi[N];",
-    "uniform vec2 uCf[N];",
-    "uniform vec2 uR[N];",
-    "uniform uint uSeed[N];",
-    "uniform float uFam[N];",
-    "uniform float uTSeed[N];",
-    "uniform vec3 uP, uPM, uQ, uQM; // folded coarse octaves: value, gradient, Hessian",
-    "",
+  var HASH = [
     "// Integer hash (pcg2d), mirrored bit-for-bit in JS so the CPU knows",
-    "// exactly where the coastline is.",
+    "// exactly where the coastline (or a cell wall) is.",
     "uvec2 pcg2d(uvec2 v){",
     "  v = v * 1664525u + 1013904223u;",
     "  v.x += v.y * 1664525u; v.y += v.x * 1664525u;",
@@ -274,7 +266,30 @@
     "  float k0 = va - vb - vc + vd;",
     "  return 1.4 * vec3(va + u.x * (vb - va) + u.y * (vc - va) + u.x * u.y * k0,",
     "    ga + u.x * (gb - ga) + u.y * (gc - ga) + u.x * u.y * (ga - gb - gc + gd) + du * (u.yx * k0 + vec2(vb, vc) - va));",
-    "}",
+    "}"
+  ].join("\n");
+
+  var FIELD_FRAG = [
+    "#version 300 es",
+    "precision highp float;",
+    "precision highp int;",
+    "#define N " + N,
+    "#define KF " + KF.toFixed(1),
+    "#define QA " + QA.toFixed(4),
+    COMMON,
+    "out vec4 fragColor;",
+    "uniform vec2 uRes;",
+    "uniform float uTime, uFade, uB, uLogA, uEfr, uTex, uMode, uKal;",
+    "uniform float uU[N];",
+    "uniform ivec2 uCi[N];",
+    "uniform vec2 uCf[N];",
+    "uniform vec2 uR[N];",
+    "uniform uint uSeed[N];",
+    "uniform float uFam[N];",
+    "uniform float uTSeed[N];",
+    "uniform vec3 uP, uPM, uQ, uQM; // folded coarse octaves: value, gradient, Hessian",
+    "",
+    HASH,
     "",
     "// ---- surface textures (Relief + textures model) ----",
     "float hash12(vec2 p){ vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }",
@@ -398,9 +413,19 @@
     "  return vec4(c, st);",
     "}",
     "",
+    "// Kaleidoscope: fold the screen into k mirrored wedges, slowly turning.",
+    "vec2 kal(vec2 p, float k, float a0){",
+    "  float seg = TAU / k, r = length(p);",
+    "  float a = mod(atan(p.y, p.x) + a0, seg);",
+    "  a = abs(a - 0.5 * seg);",
+    "  return r * vec2(cos(a), sin(a));",
+    "}",
+    "",
     "void main(){",
     "  float pxs = 2.0 / min(uRes.x, uRes.y);",
     "  vec2 s = (gl_FragCoord.xy - 0.5 * uRes) * pxs;",
+    "  vec2 s0 = s;",
+    "  if (uMode > 0.5) s = kal(s, uKal, 0.02 * uTime);",
     "",
     "  // folded coarse octaves: a quadratic patch around the screen centre",
     "  float F = uP.x + dot(uP.yz, s) + 0.5 * (uPM.x * s.x * s.x + 2.0 * uPM.y * s.x * s.y + uPM.z * s.y * s.y);",
@@ -422,6 +447,36 @@
     "  }",
     "",
     "  float fw = max(length(gF) * pxs, 1e-6);   // field change per pixel",
+    "",
+    "  if (uMode > 0.5) {",
+    "    // Psychedelic: the same level sets, painted as flowing rainbow bands.",
+    "    // Heights are seen relative to the zoom depth, so the bands keep",
+    "    // streaming out of the coastline while the shapes themselves stay.",
+    "    float t = 0.03 * uTime;",
+    "    float k = 0.16;",
+    "    float alias = 1.0 - smoothstep(0.08, 0.3, k * fw);",
+    "    vec3 rb = hue3(Q + t + k * F);",
+    "    rb = mix(vec3(0.45), rb * rb * 1.25, alias);",
+    "    float glow = 0.0;",
+    "    for (int m = -3; m <= 5; m++) {",
+    "      float e = uEfr + float(m);",
+    "      float sp = exp2(e);",
+    "      float vis = smoothstep(4.0, 10.0, sp / fw) * (1.0 - smoothstep(4.5, 6.0, e));",
+    "      if (vis <= 0.0) continue;",
+    "      float d = abs(F - sp * floor(F / sp + 0.5)) / fw;",
+    "      float rank = clamp((e + 1.0) / 5.0, 0.0, 1.0);",
+    "      glow = max(glow, vis * (1.0 - smoothstep(0.4 + rank, 1.6 + 1.6 * rank, d)) * (0.45 + 0.55 * rank));",
+    "    }",
+    "    vec3 pc = rb * (0.55 + 0.45 * cos(TAU * (k * F * 2.0 + t * 3.0)) * alias + 0.2);",
+    "    pc = mix(pc, hue3(Q + t + k * F + 0.5) * 1.15, glow * 0.85);",
+    "    float ad = abs(F) / fw;",
+    "    pc += vec3(1.0) * exp(-ad / 10.0) * 0.35;",
+    "    pc = mix(pc, vec3(1.15), 1.0 - smoothstep(0.8, 2.2, ad));",
+    "    pc *= 1.0 - 0.35 * smoothstep(0.7, 2.0, length(s0));",
+    "    fragColor = vec4(pow(max(pc, 0.0), vec3(0.95)) * uFade, 1.0);",
+    "    return;",
+    "  }",
+    "",
     "  float land = smoothstep(-0.8 * fw, 0.8 * fw, F);",
     "",
     "  // hill shading from the analytic gradient",
@@ -531,6 +586,188 @@
     "}"
   ].join("\n");
 
+  /* ------------------------------------------------------------------ *
+   * Nested worlds (Microscope, Cosmos). Every octave is a layer of cells
+   * (a Voronoi pattern with one object per cell: a cell, a diatom, a
+   * galaxy) fixed in its own frame, so each object keeps its shape as it
+   * grows. Finer layers are only bright where the coarser ones make room
+   * for them (inside cells, along spiral arms), so what appears is always
+   * the inner detail of what was already there. The camera steers away
+   * from the walls of big objects, which therefore leave through the edge
+   * of the view long before their layer is dropped.
+   * ------------------------------------------------------------------ */
+
+  var NKC = 7;              // nest layers coarser than the screen
+  var NKF = 6;              // nest layers finer than the screen
+  var NN = NKC + NKF + 1;
+  var NEST_FREQ = 2.5;      // cells per screen unit at u = 0
+
+  var NEST_FRAG = [
+    "#version 300 es",
+    "precision highp float;",
+    "precision highp int;",
+    "#define NN " + NN,
+    "#define NKC " + NKC.toFixed(1),
+    "#define NKF " + NKF.toFixed(1),
+    COMMON,
+    "out vec4 fragColor;",
+    "uniform vec2 uRes;",
+    "uniform float uTime, uFade, uB, uMode, uStain;",
+    "uniform float uU[NN];",
+    "uniform ivec2 uCi[NN];",
+    "uniform vec2 uCf[NN];",
+    "uniform vec2 uR[NN];",
+    "uniform uint uSeed[NN];",
+    "uniform float uSty[NN];",
+    "uniform float uHue[NN];",
+    "",
+    HASH,
+    "",
+    "// Voronoi cells of one layer: distance to the nearest cell wall, the",
+    "// vector from the point to its cell's site, and the cell id.",
+    "float vor(ivec2 ci, vec2 p, uint seed, out vec2 r1, out ivec2 id){",
+    "  vec2 fl = floor(p); ivec2 i0 = ci + ivec2(fl); vec2 f = p - fl;",
+    "  float d1 = 1e9, d2 = 1e9; vec2 r2 = vec2(0.0); r1 = vec2(0.0); id = i0;",
+    "  for (int j = -1; j <= 1; j++) for (int i = -1; i <= 1; i++) {",
+    "    ivec2 g = ivec2(i, j);",
+    "    vec2 o = vec2(g) + 0.5 + 0.38 * hgrad(i0 + g, seed) - f;",
+    "    float d = dot(o, o);",
+    "    if (d < d1) { d2 = d1; r2 = r1; d1 = d; r1 = o; id = i0 + g; }",
+    "    else if (d < d2) { d2 = d; r2 = o; }",
+    "  }",
+    "  vec2 dn = r2 - r1;",
+    "  return dot(0.5 * (r1 + r2), dn) * inversesqrt(max(dot(dn, dn), 1e-12));",
+    "}",
+    "",
+    "// Microscope objects. Returns wall, nucleus and body strength; m is",
+    "// how much room the object leaves for the finer layers.",
+    "vec3 specimen(float sty, vec2 r1, float e, vec2 h, vec2 h2, float aa, out float m){",
+    "  vec2 o = -r1; float rr = length(o);",
+    "  float lm, ln, lc;",
+    "  if (sty < 0.5) {",
+    "    // tissue: polygonal cells with a nucleus and nucleolus",
+    "    float rho = 0.13 + 0.05 * h.y;",
+    "    lm = 1.0 - smoothstep(0.022, 0.022 + aa, e);",
+    "    float inN = 1.0 - smoothstep(rho - aa, rho, rr);",
+    "    float env = 1.0 - smoothstep(0.012, 0.012 + aa, abs(rr - rho));",
+    "    float nuo = 1.0 - smoothstep(0.03, 0.03 + aa, length(o - 0.45 * rho * h2));",
+    "    ln = 0.45 * inN + 0.55 * env + 0.6 * nuo * inN;",
+    "    lc = smoothstep(0.0, 0.35, e) * (0.55 + 0.45 * h.x);",
+    "    m = mix(0.3, 1.0, smoothstep(0.022, 0.12, e));",
+    "  } else if (sty < 1.5) {",
+    "    // round cells packed in a matrix, pale in the middle",
+    "    float rho = 0.27 + 0.07 * h.x;",
+    "    float inside = (1.0 - smoothstep(rho - aa, rho, rr)) * smoothstep(0.0, 0.01 + aa, e);",
+    "    lm = (1.0 - smoothstep(0.014, 0.014 + aa, abs(rr - rho))) * smoothstep(0.0, aa, e);",
+    "    lm = max(lm, (1.0 - smoothstep(0.014, 0.014 + aa, e)) * step(rr, rho));",
+    "    lc = inside * (0.4 + 0.6 * smoothstep(0.0, rho, rr));",
+    "    ln = h2.x > 0.55 ? inside * (1.0 - smoothstep(0.35 * rho - aa, 0.35 * rho, length(o - 0.3 * rho * h))) : 0.0;",
+    "    m = mix(0.35, 1.0, inside);",
+    "  } else {",
+    "    // diatoms: round shells with radial ribs and rings of pores",
+    "    float rho = 0.3 + 0.06 * h.x;",
+    "    float inside = (1.0 - smoothstep(rho - aa, rho, rr)) * smoothstep(0.0, 0.01 + aa, e);",
+    "    float nR = floor(14.0 + 10.0 * (0.5 + 0.5 * h2.x));",
+    "    float ca = atan(o.y, o.x) / TAU * nR + h2.y * 3.0;",
+    "    float ribAA = aa * nR / (TAU * max(rr, 1e-3));",
+    "    float rib = (1.0 - smoothstep(0.1, 0.1 + ribAA, abs(fract(ca) - 0.5))) * (1.0 - smoothstep(0.15, 0.35, ribAA));",
+    "    float ringAA = 5.0 * aa / rho;",
+    "    float ring = (1.0 - smoothstep(0.08, 0.08 + ringAA, abs(fract(rr / rho * 5.0) - 0.5))) * (1.0 - smoothstep(0.15, 0.35, ringAA));",
+    "    lm = (1.0 - smoothstep(0.016, 0.016 + aa, abs(rr - rho))) * smoothstep(0.0, aa, e);",
+    "    lc = inside * (0.25 + 0.5 * rib * smoothstep(0.12 * rho, 0.3 * rho, rr) + 0.3 * ring);",
+    "    ln = inside * (1.0 - smoothstep(0.1 * rho - aa, 0.1 * rho, rr));",
+    "    m = mix(0.3, 1.0, inside);",
+    "  }",
+    "  return vec3(lm, ln, lc);",
+    "}",
+    "",
+    "// One galaxy per cell; far away it is a point of the same light.",
+    "vec3 galaxy(float sty, vec2 r1, vec2 h, vec2 h2, float pxl, float hue, out float m){",
+    "  vec2 o = -r1;",
+    "  float R = 0.14 + 0.1 * (0.5 + 0.5 * h.x);",
+    "  float ca = cos(h.y * 3.14159), sa = sin(h.y * 3.14159);",
+    "  vec2 g = mat2(ca, sa, -sa, ca) * o;",
+    "  g.y *= 1.0 + 1.4 * (0.5 + 0.5 * h2.y);",
+    "  float rg = length(g) / R;",
+    "  float disc, bulge;",
+    "  if (h2.x > (sty < 0.5 ? -0.4 : 0.4)) {",
+    "    float wind = (fract(h.x * 7.31) > 0.5 ? 1.0 : -1.0) * (3.0 + 3.0 * fract(h.y * 4.13));",
+    "    float nA = fract(h.y * 5.17) > 0.7 ? 3.0 : 2.0;",
+    "    float arms = 0.5 + 0.5 * cos(nA * atan(g.y, g.x) - wind * log(rg + 0.05));",
+    "    disc = exp(-2.6 * rg) * (0.15 + 1.1 * arms * arms * arms) * (1.0 - smoothstep(1.0, 1.6, rg));",
+    "    bulge = exp(-rg * rg * 28.0);",
+    "  } else {",
+    "    disc = 0.9 * exp(-3.2 * pow(rg, 0.8)) * (1.0 - smoothstep(1.3, 2.0, rg));",
+    "    bulge = 0.7 * exp(-rg * rg * 14.0);",
+    "  }",
+    "  float halo = exp(-0.9 * rg);",
+    "  m = min(1.0, 0.4 + 0.2 * halo + 0.9 * clamp(1.4 * disc * smoothstep(0.06, 0.25, rg), 0.0, 1.0));",
+    "  vec3 warm = vec3(1.0, 0.78, 0.52);",
+    "  vec3 cool = mix(vec3(0.55, 0.7, 1.0), hue3(hue), sty > 1.5 ? 0.5 : 0.25);",
+    "  vec3 col = cool * disc * 0.8 + warm * bulge * 1.4 + warm * 0.03 * halo;",
+    "  float sg = max(pxl * 0.8, R * 0.3);",
+    "  float lum = 0.4 + 0.6 * fract(h2.x * 9.7 + h2.y * 3.3);",
+    "  float pt = 0.25 * lum * R * R / (sg * sg) * exp(-dot(o, o) / (2.0 * sg * sg));",
+    "  return mix(mix(warm, cool, 0.5) * pt, col, smoothstep(1.5, 5.0, R / pxl));",
+    "}",
+    "",
+    "void main(){",
+    "  float pxs = 2.0 / min(uRes.x, uRes.y);",
+    "  vec2 s = (gl_FragCoord.xy - 0.5 * uRes) * pxs;",
+    "  bool cosmos = uMode > 0.5;",
+    "  vec3 absorb = vec3(0.0), emit = vec3(0.0);",
+    "  float ld = 0.0;   // log of the room the coarser layers leave",
+    "  for (int k = 0; k < NN; k++) {",
+    "    float u = uU[k];",
+    "    float sc = uB * exp2(u);",
+    "    float pxl = sc * pxs;          // layer units per pixel",
+    "    float w = smoothstep(-NKC, -NKC + 2.5, u) * (1.0 - smoothstep(NKF - 1.0, NKF, u));",
+    "    w *= cosmos ? 1.0 - smoothstep(0.25, 0.5, pxl) : 1.0 - smoothstep(0.1, 0.22, pxl);",
+    "    if (w < 0.003) continue;",
+    "    mat2 R = mat2(uR[k].x, uR[k].y, -uR[k].y, uR[k].x);",
+    "    vec2 r1; ivec2 id;",
+    "    float e = vor(uCi[k], uCf[k] + R * (s * sc), uSeed[k], r1, id);",
+    "    vec2 h = hgrad(id, uSeed[k] ^ 0x0051ed27u), h2 = hgrad(id, uSeed[k] ^ 0x2c1b3c6du);",
+    "    float a = w * exp(ld), m;",
+    "    if (cosmos) {",
+    "      float gain = mix(0.35, 1.0, smoothstep(-4.0, -1.5, u));",
+    "      emit += a * gain * galaxy(uSty[k], r1, h, h2, pxl, uHue[k] + 0.1 * h.x, m);",
+    "    } else {",
+    "      vec3 L = specimen(uSty[k], r1, e, h, h2, pxl * 1.2, m);",
+    "      float hv = uHue[k] + 0.08 * h.x;",
+    "      if (uStain < 0.5) {",
+    "        // H&E: eosin pink bodies, haematoxylin purple nuclei",
+    "        vec3 dyeC = mix(vec3(0.05, 0.75, 0.3), vec3(0.1, 0.6, 0.15), fract(hv));",
+    "        vec3 dyeN = vec3(0.75, 0.85, 0.22);",
+    "        absorb += a * (L.z * 0.22 * dyeC + L.x * 0.8 * mix(dyeC, dyeN, 0.5) + L.y * 0.9 * dyeN);",
+    "      } else if (uStain < 1.5) {",
+    "        // fluorescence: glowing walls, blue nuclei",
+    "        emit += a * (L.x * 0.75 * hue3(hv) + L.y * 0.6 * vec3(0.25, 0.45, 1.0) + L.z * 0.06 * hue3(hv + 0.33));",
+    "      } else {",
+    "        // Giemsa: blue-violet stain on pale pink",
+    "        vec3 dyeC = vec3(0.55, 0.35, 0.08 + 0.1 * fract(hv));",
+    "        vec3 dyeN = vec3(0.9, 0.95, 0.15);",
+    "        absorb += a * (L.z * 0.2 * dyeC + L.x * 0.7 * dyeN + L.y * 0.85 * vec3(0.7, 1.0, 0.3));",
+    "      }",
+    "    }",
+    "    ld = 0.5 * ld + w * log(m);",
+    "  }",
+    "  vec3 col;",
+    "  float r = length(s);",
+    "  if (cosmos) {",
+    "    col = 1.0 - exp(-emit * 1.3);",
+    "    col *= 1.0 - 0.3 * smoothstep(0.6, 1.9, r);",
+    "  } else {",
+    "    col = uStain > 0.5 && uStain < 1.5 ? 1.0 - exp(-emit * 1.4)",
+    "        : (uStain < 0.5 ? vec3(0.97, 0.95, 0.92) : vec3(0.98, 0.94, 0.95)) * exp(-absorb);",
+    "    // the round field of view of the eyepiece",
+    "    col *= 1.0 - smoothstep(1.05, 1.2, r);",
+    "    col *= 1.0 - 0.25 * smoothstep(0.5, 1.15, r);",
+    "  }",
+    "  fragColor = vec4(pow(max(col, 0.0), vec3(0.95)) * uFade, 1.0);",
+    "}"
+  ].join("\n");
+
   function compile(type, src) {
     var sh = gl.createShader(type);
     gl.shaderSource(sh, src);
@@ -554,10 +791,12 @@
     return { prog: p, U: U };
   }
 
-  var fieldProg = program(FIELD_FRAG, ["uRes", "uTime", "uFade", "uB", "uLogA", "uEfr", "uTex",
+  var fieldProg = program(FIELD_FRAG, ["uRes", "uTime", "uFade", "uB", "uLogA", "uEfr", "uTex", "uMode", "uKal",
     "uU", "uCi", "uCf", "uR", "uSeed", "uFam", "uTSeed", "uP", "uPM", "uQ", "uQM"]);
   var juliaProg = program(JULIA_FRAG, ["uRes", "uFade", "uPx", "uHue", "uHueOff", "uBandOff",
     "uC", "uZ", "uL", "uW", "uLn", "uN"]);
+  var nestProg = program(NEST_FRAG, ["uRes", "uTime", "uFade", "uB", "uMode", "uStain",
+    "uU", "uCi", "uCf", "uR", "uSeed", "uSty", "uHue"]);
 
   /* ------------------------------------------------------------------ *
    * The fractal field, mirrored on the CPU.
@@ -744,6 +983,7 @@
     field.P.fill(0); field.Q.fill(0);
     field.Q[0] = Math.random();
     field.runFam = -1; field.runUntil = -1e9;
+    field.kal = 5 + Math.floor(Math.random() * 5);   // kaleidoscope wedges (Psychedelic)
     var a = Math.random() * Math.PI * 2;
     field.tx = Math.cos(a); field.ty = Math.sin(a);
     syncLevels();
@@ -768,7 +1008,8 @@
     var q = 3 + Math.floor(Math.random() * 7), p;
     do { p = 1 + Math.floor(Math.random() * (q - 1)); } while (gcd(p, q) !== 1);
     var turn = p / q; if (turn > 0.5) turn -= 1;
-    turn += (Math.random() - 0.5) * 0.012;
+    // A slight detuning bends the q arms into a slow spiral.
+    turn += (Math.random() - 0.5) * 0.004;
     var th = turn * Math.PI * 2, r = 1.06 + Math.random() * 0.14;
     var lx = r * Math.cos(th), ly = r * Math.sin(th);
     var ax = lx / 2, ay = ly / 2;               // fixed point a = L / 2
@@ -779,8 +1020,174 @@
     julia.n = Math.min(400, Math.ceil(Math.log(SIGMA0 * 2.5 / 1e-4) / Math.log(r)));
     var rn = Math.pow(r, -julia.n), an = -julia.n * th;
     julia.Ln = [rn * Math.cos(an), rn * Math.sin(an)];
+    // One zoom period is q iterations: L^q has |L|^q zoom and turns by
+    // q * theta, a whole number of turns plus the small detuning. A single
+    // iteration would spin by about 360 * p / q degrees for only a 1.1x zoom.
+    julia.rq = Math.pow(r, q);
+    var aq = q * th;
+    julia.aq = aq - Math.round(aq / (Math.PI * 2)) * Math.PI * 2;
     julia.hue = Math.random();
     julia.D = 0; julia.m = 0;
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Nested worlds state (Microscope, Cosmos), mirrored on the CPU so
+   * the camera knows where the walls and the bright arms are.
+   * ------------------------------------------------------------------ */
+
+  var STYLES = {
+    microscope: ["tissue", "cells", "diatoms"],
+    cosmos: ["spirals", "ellipticals", "starbursts"]
+  };
+  var STAINS = ["H&E", "fluorescence", "Giemsa"];
+
+  var nest = {
+    levels: new Map(),
+    d: 0,                              // depth in octaves
+    kind: "microscope",
+    stain: 0,                          // 0 H&E, 1 fluorescence, 2 Giemsa
+    hueWalk: 0,                        // hue drifts from layer to layer
+    runSty: -1, runUntil: -1e9,        // object style runs across octaves
+    wa: 0, vx: 0, vy: 0                // slow drift heading and camera velocity
+  };
+
+  function fract(x) { return x - Math.floor(x); }
+
+  function newNestLevel(L) {
+    if (L >= nest.runUntil) {
+      var sty;
+      do { sty = Math.floor(Math.random() * 3); } while (sty === nest.runSty);
+      nest.runSty = sty;
+      nest.runUntil = L + 3 + Math.floor(Math.random() * 4);
+    }
+    var h = nest.hueWalk + (Math.random() - 0.5) * 0.16;
+    nest.hueWalk = h < 0 ? -h : (h > 1 ? 2 - h : h);
+    var ang = Math.random() * Math.PI * 2;
+    return {
+      cs: Math.cos(ang), sn: Math.sin(ang),
+      cx: COORD0 + Math.random() * 1024, cy: COORD0 + Math.random() * 1024,
+      seed: Math.floor(Math.random() * 4294967296) >>> 0,
+      sty: nest.runSty, hue: nest.hueWalk
+    };
+  }
+
+  function syncNest() {
+    var n = Math.floor(nest.d);
+    nest.levels.forEach(function (lv, L) { if (L < n - NKC) nest.levels.delete(L); });
+    for (var L = n - NKC; L <= n + NKF; L++) {
+      if (!nest.levels.has(L)) nest.levels.set(L, newNestLevel(L));
+    }
+  }
+
+  function panNest(dx, dy) {
+    nest.levels.forEach(function (lv, L) {
+      var sc = NEST_FREQ * Math.pow(2, L - nest.d);
+      lv.cx += (lv.cs * dx - lv.sn * dy) * sc;
+      lv.cy += (lv.sn * dx + lv.cs * dy) * sc;
+    });
+  }
+
+  function zoomNest(dz) {
+    if (dz <= 0) return;
+    nest.d += dz;
+    syncNest();
+  }
+
+  // Mirror of vor() and the per-cell hashes in NEST_FRAG.
+  var VO = { e: 0, rx: 0, ry: 0, hx: 0, hy: 0, h2x: 0, h2y: 0 };
+  function vorAt(lv, sc, sx, sy) {
+    var px = lv.cx + (lv.cs * sx - lv.sn * sy) * sc;
+    var py = lv.cy + (lv.sn * sx + lv.cs * sy) * sc;
+    var x0 = Math.floor(px), y0 = Math.floor(py), fx = px - x0, fy = py - y0;
+    var d1 = 1e9, d2 = 1e9, r1x = 0, r1y = 0, r2x = 0, r2y = 0, ix = x0, iy = y0;
+    for (var j = -1; j <= 1; j++) for (var i = -1; i <= 1; i++) {
+      hgrad(x0 + i, y0 + j, lv.seed);
+      var ox = i + 0.5 + 0.38 * HG[0] - fx, oy = j + 0.5 + 0.38 * HG[1] - fy;
+      var d = ox * ox + oy * oy;
+      if (d < d1) { d2 = d1; r2x = r1x; r2y = r1y; d1 = d; r1x = ox; r1y = oy; ix = x0 + i; iy = y0 + j; }
+      else if (d < d2) { d2 = d; r2x = ox; r2y = oy; }
+    }
+    var nx = r2x - r1x, ny = r2y - r1y;
+    VO.e = (0.5 * (r1x + r2x) * nx + 0.5 * (r1y + r2y) * ny) / Math.sqrt(Math.max(nx * nx + ny * ny, 1e-12));
+    VO.rx = r1x; VO.ry = r1y;
+    hgrad(ix, iy, (lv.seed ^ 0x0051ed27) >>> 0); VO.hx = HG[0]; VO.hy = HG[1];
+    hgrad(ix, iy, (lv.seed ^ 0x2c1b3c6d) >>> 0); VO.h2x = HG[0]; VO.h2y = HG[1];
+  }
+
+  // Radius of the round part of a microscope object (nucleus or shell).
+  function rhoOf(sty) {
+    return sty === 0 ? 0.13 + 0.05 * VO.hy : sty === 1 ? 0.27 + 0.07 * VO.hx : 0.3 + 0.06 * VO.hx;
+  }
+
+  // Room a galaxy leaves for finer layers (m in galaxy()).
+  function galaxyM(sty) {
+    var ox = -VO.rx, oy = -VO.ry, hx = VO.hx, hy = VO.hy;
+    var R = 0.14 + 0.1 * (0.5 + 0.5 * hx);
+    var ca = Math.cos(hy * Math.PI), sa = Math.sin(hy * Math.PI);
+    var gx = ca * ox - sa * oy, gy = sa * ox + ca * oy;
+    gy *= 1 + 1.4 * (0.5 + 0.5 * VO.h2y);
+    var rg = Math.sqrt(gx * gx + gy * gy) / R, disc;
+    if (VO.h2x > (sty === 0 ? -0.4 : 0.4)) {
+      var wind = (fract(hx * 7.31) > 0.5 ? 1 : -1) * (3 + 3 * fract(hy * 4.13));
+      var nA = fract(hy * 5.17) > 0.7 ? 3 : 2;
+      var arms = 0.5 + 0.5 * Math.cos(nA * Math.atan2(gy, gx) - wind * Math.log(rg + 0.05));
+      disc = Math.exp(-2.6 * rg) * (0.15 + 1.1 * arms * arms * arms) * (1 - smooth(1, 1.6, rg));
+    } else {
+      disc = 0.9 * Math.exp(-3.2 * Math.pow(rg, 0.8)) * (1 - smooth(1.3, 2, rg));
+    }
+    var cov = Math.min(1, Math.max(0, 1.4 * disc * smooth(0.06, 0.25, rg)));
+    return Math.min(1, 0.4 + 0.2 * Math.exp(-0.9 * rg) + 0.9 * cov);
+  }
+
+  // Steering potential at a screen point (lower is better). Microscope:
+  // keep away from the walls and rims of objects on screen and above.
+  // Cosmos: climb to where galaxies leave the most room (arms, discs).
+  function nestPot(sx, sy) {
+    var n = Math.floor(nest.d), V = 0, cosmos = nest.kind === "cosmos";
+    for (var L = n - NKC; L <= n + 1; L++) {
+      var lv = nest.levels.get(L), u = L - nest.d;
+      var w = smooth(-NKC, -NKC + 2.5, u) * (1 - smooth(-0.5, 1, u));
+      if (w <= 0) continue;
+      var sc = NEST_FREQ * Math.pow(2, u);
+      vorAt(lv, sc, sx, sy);
+      if (cosmos) {
+        V -= w * Math.min(2.6, 0.5 / sc) * Math.log(galaxyM(lv.sty));
+      } else {
+        var rr = Math.sqrt(VO.rx * VO.rx + VO.ry * VO.ry);
+        var bd = Math.min(VO.e, Math.abs(rr - rhoOf(lv.sty))) / sc;
+        var R = Math.min(2.6, 0.22 / sc);
+        if (bd < R) { var x = 1 - bd / R; V += w * R * x * x; }
+      }
+    }
+    return V;
+  }
+
+  function steerNest(dt, sp) {
+    var h = 0.01;
+    var gx = (nestPot(h, 0) - nestPot(-h, 0)) / (2 * h);
+    var gy = (nestPot(0, h) - nestPot(0, -h)) / (2 * h);
+    nest.wa += (Math.random() - 0.5) * dt * 0.8;
+    var vd = 0.02 + 0.12 * sp;
+    var tx = -gx * 0.8 + Math.cos(nest.wa) * vd, ty = -gy * 0.8 + Math.sin(nest.wa) * vd;
+    var k = Math.min(1, dt * 3);
+    nest.vx += (tx - nest.vx) * k; nest.vy += (ty - nest.vy) * k;
+    var dx = nest.vx * dt, dy = nest.vy * dt;
+    var m = Math.hypot(dx, dy), lim = (0.3 + 1.2 * sp) * dt;
+    if (m > lim) { dx *= lim / m; dy *= lim / m; }
+    panNest(dx, dy);
+  }
+
+  function initNest(kind) {
+    nest.levels.clear();
+    nest.d = 0;
+    nest.kind = kind;
+    nest.stain = Math.floor(Math.random() * 3);
+    nest.hueWalk = Math.random();
+    nest.runSty = -1; nest.runUntil = -1e9;
+    nest.wa = Math.random() * Math.PI * 2; nest.vx = 0; nest.vy = 0;
+    syncNest();
+    // let the camera settle away from walls (or onto an arm) before showing
+    for (var i = 0; i < 60; i++) steerNest(0.05, 0);
   }
 
   /* ------------------------------------------------------------------ *
@@ -836,7 +1243,9 @@
   }
 
   function octaves() {
-    return state.model === "julia" ? (julia.m + julia.D) * Math.log2(julia.r) : field.d;
+    var eng = ENGINE[state.model];
+    if (eng === "julia") return (julia.m + julia.D) * Math.log2(julia.rq);
+    return eng === "nest" ? nest.d : field.d;
   }
 
   function fmtC(x, y) {
@@ -848,7 +1257,16 @@
     scaleEl.innerHTML = "Magnification <b>" + fmtMag(Math.pow(2, d)) + "×</b> · octave <b>" + Math.floor(d) + "</b>";
     if (state.model === "julia") {
       strataEl.textContent = "c = " + fmtC(julia.C[0], julia.C[1]) + " · " + julia.q + " arms · turns " +
-        Math.round(julia.th * 180 / Math.PI) + "° per " + julia.r.toFixed(2) + "×";
+        Math.round(julia.aq * 180 / Math.PI) + "° per " + julia.rq.toFixed(2) + "× cycle";
+    } else if (ENGINE[state.model] === "nest") {
+      var sn = [], m = Math.floor(nest.d), st = STYLES[nest.kind];
+      for (var J = m; J <= m + 3; J++) {
+        var sname = st[nest.levels.get(J).sty];
+        if (sn.indexOf(sname) < 0) sn.push(sname);
+      }
+      strataEl.textContent = (nest.kind === "cosmos" ? "Deep field › " : STAINS[nest.stain] + " stain › ") + sn.join(" › ");
+    } else if (state.model === "psychedelic") {
+      strataEl.textContent = "Kaleidoscope of " + field.kal + " › coastline › contours";
     } else if (state.model === "textured") {
       var names = [], n = Math.floor(field.d);
       for (var L = n; L <= n + 3; L++) {
@@ -871,7 +1289,8 @@
 
   function reseed() {
     transition(function () {
-      if (state.model === "julia") newJulia(); else initField();
+      var eng = ENGINE[state.model];
+      if (eng === "julia") newJulia(); else if (eng === "nest") initNest(state.model); else initField();
     });
   }
 
@@ -879,12 +1298,16 @@
     if (!MODELS[m]) return;
     modelEl.value = m;
     try { localStorage.setItem("infinite-atlas:model", m); } catch (e) { /* storage unavailable */ }
-    var fieldNow = state.model !== "julia", fieldNext = m !== "julia";
-    if (fieldNow && fieldNext) {
+    var plain = { relief: 1, textured: 1 };
+    if (plain[state.model] && plain[m]) {
       // Same world, textures just fade in or out.
       state.model = m;
     } else {
-      transition(function () { state.model = m; state.tex = m === "textured" ? 1 : 0; });
+      transition(function () {
+        // Entering the nested engine (or switching microscope <-> cosmos) starts a new world.
+        if (ENGINE[m] === "nest" && (ENGINE[state.model] !== "nest" || nest.kind !== m)) initNest(m);
+        state.model = m; state.tex = m === "textured" ? 1 : 0;
+      });
     }
     describe();
     wake();
@@ -999,6 +1422,8 @@
     gl.uniform1f(U.uLogA, LOG2A);
     gl.uniform1f(U.uEfr, efr);
     gl.uniform1f(U.uTex, state.tex);
+    gl.uniform1f(U.uMode, state.model === "psychedelic" ? 1 : 0);
+    gl.uniform1f(U.uKal, field.kal);
     gl.uniform1fv(U.uU, bufU);
     gl.uniform2iv(U.uCi, bufCi);
     gl.uniform2fv(U.uCf, bufCf);
@@ -1017,8 +1442,9 @@
     var U = juliaProg.U;
     gl.useProgram(juliaProg.prog);
     var fr = julia.D;
-    var mag = SIGMA0 * Math.pow(julia.r, -fr), ang = -julia.th * fr;
-    var hueOff = julia.m * 0.045, bandOff = julia.m * 0.35;
+    var mag = SIGMA0 * Math.pow(julia.rq, -fr), ang = -julia.aq * fr;
+    // each period is q iterations deeper, so escape counts shift by q
+    var hueOff = julia.m * julia.q * 0.045, bandOff = julia.m * julia.q * 0.35;
     gl.uniform2f(U.uRes, canvas.width, canvas.height);
     gl.uniform1f(U.uFade, state.fade);
     gl.uniform1f(U.uPx, mag * 2 / Math.min(canvas.width, canvas.height));
@@ -1031,6 +1457,38 @@
     gl.uniform2f(U.uW, mag * Math.cos(ang), mag * Math.sin(ang));
     gl.uniform2f(U.uLn, julia.Ln[0], julia.Ln[1]);
     gl.uniform1i(U.uN, julia.n);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+
+  var nbU = new Float32Array(NN), nbCi = new Int32Array(2 * NN), nbCf = new Float32Array(2 * NN);
+  var nbR = new Float32Array(2 * NN), nbSeed = new Uint32Array(NN);
+  var nbSty = new Float32Array(NN), nbHue = new Float32Array(NN);
+
+  function drawNest() {
+    var U = nestProg.U, n = Math.floor(nest.d);
+    gl.useProgram(nestProg.prog);
+    for (var k = 0; k < NN; k++) {
+      var L = n - NKC + k, lv = nest.levels.get(L);
+      var ix = Math.floor(lv.cx), iy = Math.floor(lv.cy);
+      nbU[k] = L - nest.d;
+      nbCi[2 * k] = ix; nbCi[2 * k + 1] = iy;
+      nbCf[2 * k] = lv.cx - ix; nbCf[2 * k + 1] = lv.cy - iy;
+      nbR[2 * k] = lv.cs; nbR[2 * k + 1] = lv.sn;
+      nbSeed[k] = lv.seed; nbSty[k] = lv.sty; nbHue[k] = lv.hue;
+    }
+    gl.uniform2f(U.uRes, canvas.width, canvas.height);
+    gl.uniform1f(U.uTime, state.time);
+    gl.uniform1f(U.uFade, state.fade);
+    gl.uniform1f(U.uB, NEST_FREQ);
+    gl.uniform1f(U.uMode, nest.kind === "cosmos" ? 1 : 0);
+    gl.uniform1f(U.uStain, nest.stain);
+    gl.uniform1fv(U.uU, nbU);
+    gl.uniform2iv(U.uCi, nbCi);
+    gl.uniform2fv(U.uCf, nbCf);
+    gl.uniform2fv(U.uR, nbR);
+    gl.uniform1uiv(U.uSeed, nbSeed);
+    gl.uniform1fv(U.uSty, nbSty);
+    gl.uniform1fv(U.uHue, nbHue);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
   }
 
@@ -1048,10 +1506,14 @@
 
     var sp = speed();
 
-    if (state.model === "julia") {
-      // D counts multiplier periods; each one is a zoom of |L|.
-      julia.D += sp * dt / Math.log2(julia.r);
+    var eng = ENGINE[state.model];
+    if (eng === "julia") {
+      // D counts periods; each one is a zoom of |L|^q.
+      julia.D += sp * dt / Math.log2(julia.rq);
       while (julia.D >= 1) { julia.D -= 1; julia.m += 1; }
+    } else if (eng === "nest") {
+      zoomNest(sp * dt);
+      if (!state.paused) steerNest(dt, sp);
     } else {
       zoomField(sp * dt);
       if (!state.paused) steer(dt, sp);
@@ -1071,7 +1533,8 @@
       if (state.transT >= 1) { state.transT = -1; state.fade = 1; }
     }
 
-    if (state.model === "julia") drawJulia(); else drawField();
+    eng = ENGINE[state.model];
+    if (eng === "julia") drawJulia(); else if (eng === "nest") drawNest(); else drawField();
 
     infoClock -= dt;
     if (infoClock <= 0) { infoClock = 0.25; describe(); }
@@ -1082,6 +1545,7 @@
 
   initField();
   newJulia();
+  initNest(ENGINE[startModel] === "nest" ? startModel : "microscope");
   describe();
   showRate();
   requestAnimationFrame(frame);
