@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="description" content="Endless zoom through an ever-new procedural atlas of nebulae, terrain, rivers, cells, stars and snow crystals.">
+<meta name="description" content="Endless, continuous zoom into a fractal world: every shape you see keeps its form and sprouts finer detail as you descend.">
 <title>Infinite Atlas</title>
 <meta name="claude:viewport-fit-sides" content="cover">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant:wght@300;500&family=IBM+Plex+Mono:wght@400;500&display=swap">
@@ -96,12 +96,12 @@
     #bar .inner { border: 1px solid var(--edge); border-radius: 14px; margin-bottom: 16px; padding-block: 14px; }
   }
 
-  label[for="speed"] {
+  #bar label {
     font-size: 10px; letter-spacing: 0.16em; text-transform: uppercase;
     color: var(--ink-dim); white-space: nowrap;
   }
   #speed {
-    flex: 1 1 180px; min-width: 0;
+    flex: 1 1 160px; min-width: 0;
     accent-color: var(--accent);
     height: 22px; cursor: ew-resize;
   }
@@ -109,20 +109,23 @@
     font-size: 12px; font-variant-numeric: tabular-nums;
     color: var(--ink); min-width: 10.5ch; text-align: right; white-space: nowrap;
   }
-  button {
+  button, select {
     font-family: var(--mono); font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase;
     color: var(--ink); background: rgba(240, 194, 122, 0.1);
     border: 1px solid var(--edge); border-radius: 8px;
     padding: 8px 12px; cursor: pointer;
     transition: background 180ms ease, border-color 180ms ease;
   }
-  button:hover { background: rgba(240, 194, 122, 0.2); border-color: rgba(240, 194, 122, 0.5); }
+  select { padding-right: 8px; }
+  select option { background: #10141b; color: var(--ink); }
+  button:hover, select:hover { background: rgba(240, 194, 122, 0.2); border-color: rgba(240, 194, 122, 0.5); }
+  .group { display: flex; align-items: center; gap: 10px; }
   #hint {
     flex: 0 0 100%; margin: 0;
     font-size: 10px; letter-spacing: 0.1em; color: var(--ink-dim);
   }
 
-  :is(button, input, a):focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+  :is(button, input, select, a):focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
   .veiled { opacity: 0; }
 </style>
 </head>
@@ -137,11 +140,19 @@
 
 <div id="bar">
   <div class="inner">
+    <div class="group">
+      <label for="model">Model</label>
+      <select id="model">
+        <option value="relief">Relief</option>
+        <option value="textured">Relief + textures</option>
+        <option value="julia">Julia spiral</option>
+      </select>
+    </div>
     <label for="speed">Zoom speed</label>
     <input id="speed" type="range" min="0" max="1000" step="1" value="250" aria-describedby="rate">
     <span id="rate">&mdash;</span>
     <button id="reseed" type="button">New world</button>
-    <p id="hint">Space pauses the descent &middot; R charts a new world</p>
+    <p id="hint">Space pauses the descent &middot; R charts a new world &middot; M switches model</p>
   </div>
 </div>
 
@@ -163,23 +174,38 @@
   }
 
   /* ------------------------------------------------------------------ *
-   * How the endless map works.
+   * How the endless relief works.
    *
-   * The view is a stack of N octave layers, each twice as fine as the
-   * one above it. Every layer owns its own coordinate frame (offset and
-   * rotation, kept in JS doubles), its own pattern family and its own
-   * hue. Zooming in slides every layer towards the coarse end; when the
-   * coarsest layer has grown past the screen it is retired and a brand
-   * new, randomly generated layer is born at the fine end. Nothing is
-   * ever reused, so the descent keeps revealing new structure, and no
-   * coordinate the shader sees ever grows large enough to lose float
-   * precision.
+   * The world is ONE fractal height field h, the sum of infinitely many
+   * octaves of gradient noise, each twice as fine and A times as tall as
+   * the one above. The coastline (h = 0) and the contour lines are level
+   * sets of that single field, so zooming never replaces them: a shape on
+   * screen keeps its form while each new octave adds bays, ridges and
+   * finer contours to it, exactly as a microscope reveals more of what
+   * was already there.
+   *
+   * Only a window of octaves is evaluated per pixel. Octaves too fine to
+   * see are not drawn yet; octaves much coarser than the screen are folded
+   * into a quadratic Taylor patch (value, gradient, Hessian at the centre)
+   * computed in JS doubles. The shader sees the field normalised by A^depth,
+   * so all numbers stay near 1 at any depth, and every layer keeps its
+   * own small coordinate frame, so float precision never runs out.
+   *
+   * The camera steers along the coastline, so the descent always stays
+   * on the boundary where the fractal detail lives.
    * ------------------------------------------------------------------ */
 
-  var N = 7;           // live octave layers
-  var BASE_FREQ = 3.0; // features per screen unit at u = 0
+  var KC = 11;              // live octaves coarser than the screen
+  var KF = 5;               // live octaves finer than the screen
+  var N = KC + KF + 1;      // live octave layers in the shader
+  var BASE_FREQ = 3.0;      // noise cells per screen unit at u = 0
+  var A = 0.62;             // amplitude ratio per octave (roughness)
+  var LOG2A = Math.log2(A);
+  var QA = 0.06;            // hue variation per octave
+  var COORD0 = 4096;        // layer frames live around here (keeps ints positive)
 
   var FAMILIES = ["nebula", "relief", "rivers", "tissue", "starfield", "crystals", "currents"];
+  var MODELS = { relief: "Relief", textured: "Relief + textures", julia: "Julia spiral" };
 
   var VERT = [
     "#version 300 es",
@@ -189,24 +215,70 @@
     "}"
   ].join("\n");
 
-  var FRAG = [
+  var COMMON = [
+    "#define TAU 6.283185307179586",
+    "vec3 hue3(float h){ return 0.5 + 0.5 * cos(TAU * (h + vec3(0.0, 0.333, 0.667))); }",
+    "// t runs from shadow (0) to highlight (1) inside one hue family.",
+    "vec3 pal(float h, float t){",
+    "  vec3 c = hue3(h + 0.12 * t);",
+    "  float l = dot(c, vec3(0.299, 0.587, 0.114));",
+    "  c = mix(vec3(l), c, 0.72);",
+    "  return c * (0.08 + 1.05 * t);",
+    "}"
+  ].join("\n");
+
+  var FIELD_FRAG = [
     "#version 300 es",
     "precision highp float;",
+    "precision highp int;",
     "#define N " + N,
-    "#define TAU 6.283185307179586",
+    "#define KF " + KF.toFixed(1),
+    "#define QA " + QA.toFixed(4),
+    COMMON,
     "out vec4 fragColor;",
     "uniform vec2 uRes;",
-    "uniform float uTime, uFade, uF, uBgHue;",
+    "uniform float uTime, uFade, uB, uLogA, uEfr, uTex;",
     "uniform float uU[N];",
-    "uniform vec2 uC[N];",
+    "uniform ivec2 uCi[N];",
+    "uniform vec2 uCf[N];",
     "uniform vec2 uR[N];",
+    "uniform uint uSeed[N];",
     "uniform float uFam[N];",
-    "uniform float uSeed[N];",
-    "uniform float uHue[N];",
+    "uniform float uTSeed[N];",
+    "uniform vec3 uP, uPM, uQ, uQM; // folded coarse octaves: value, gradient, Hessian",
     "",
+    "// Integer hash (pcg2d), mirrored bit-for-bit in JS so the CPU knows",
+    "// exactly where the coastline is.",
+    "uvec2 pcg2d(uvec2 v){",
+    "  v = v * 1664525u + 1013904223u;",
+    "  v.x += v.y * 1664525u; v.y += v.x * 1664525u;",
+    "  v ^= (v >> 16u);",
+    "  v.x += v.y * 1664525u; v.y += v.x * 1664525u;",
+    "  v ^= (v >> 16u);",
+    "  return v;",
+    "}",
+    "vec2 hgrad(ivec2 i, uint seed){",
+    "  uvec2 h = pcg2d(uvec2(i) + uvec2(seed, seed * 747796405u));",
+    "  return vec2(h) * 4.656612873077393e-10 - 1.0;",
+    "}",
+    "// Gradient noise with analytic derivatives; ci is the integer part of",
+    "// the layer frame, p the small fractional part plus the screen offset.",
+    "vec3 noised(ivec2 ci, vec2 p, uint seed){",
+    "  vec2 fl = floor(p); ivec2 i = ci + ivec2(fl); vec2 f = p - fl;",
+    "  vec2 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);",
+    "  vec2 du = 30.0 * f * f * (f * (f - 2.0) + 1.0);",
+    "  vec2 ga = hgrad(i, seed), gb = hgrad(i + ivec2(1, 0), seed);",
+    "  vec2 gc = hgrad(i + ivec2(0, 1), seed), gd = hgrad(i + ivec2(1, 1), seed);",
+    "  float va = dot(ga, f), vb = dot(gb, f - vec2(1.0, 0.0));",
+    "  float vc = dot(gc, f - vec2(0.0, 1.0)), vd = dot(gd, f - vec2(1.0, 1.0));",
+    "  float k0 = va - vb - vc + vd;",
+    "  return 1.4 * vec3(va + u.x * (vb - va) + u.y * (vc - va) + u.x * u.y * k0,",
+    "    ga + u.x * (gb - ga) + u.y * (gc - ga) + u.x * u.y * (ga - gb - gc + gd) + du * (u.yx * k0 + vec2(vb, vc) - va));",
+    "}",
+    "",
+    "// ---- surface textures (Relief + textures model) ----",
     "float hash12(vec2 p){ vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }",
     "vec2 hash22(vec2 p){ vec3 p3 = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973)); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.xx + p3.yz) * p3.zy); }",
-    "",
     "float gnoise(vec2 p){",
     "  vec2 i = floor(p), f = fract(p);",
     "  vec2 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);",
@@ -221,20 +293,9 @@
     "  for (int i = 0; i < 3; i++) { s += a * gnoise(p); p = mat2(1.6, 1.2, -1.2, 1.6) * p + 11.7; a *= 0.5; }",
     "  return s;",
     "}",
-    "",
     "mat2 rot(float a){ float c = cos(a), s = sin(a); return mat2(c, s, -s, c); }",
     "float sdSeg(vec2 p, vec2 a, vec2 b){ vec2 pa = p - a, ba = b - a; float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0); return length(pa - ba * h); }",
     "float sdHex(vec2 p, float r){ p = abs(p); return max(p.x * 0.8660254 + p.y * 0.5, p.y) - r; }",
-    "",
-    "vec3 hue3(float h){ return 0.5 + 0.5 * cos(TAU * (h + vec3(0.0, 0.333, 0.667))); }",
-    "// t runs from shadow (0) to highlight (1) inside one hue family.",
-    "vec3 pal(float h, float t){",
-    "  vec3 c = hue3(h + 0.12 * t);",
-    "  float l = dot(c, vec3(0.299, 0.587, 0.114));",
-    "  c = mix(vec3(l), c, 0.72);",
-    "  return c * (0.08 + 1.05 * t);",
-    "}",
-    "",
     "vec3 voro(vec2 x, out vec2 id, out vec2 rc){",
     "  vec2 n = floor(x), f = fract(x);",
     "  float d1 = 8.0, d2 = 8.0;",
@@ -247,7 +308,6 @@
     "  }",
     "  return vec3(sqrt(d1), sqrt(d2), 0.0);",
     "}",
-    "",
     "float flake(vec2 p, float k, float br, float ang){",
     "  float seg = TAU / k;",
     "  float a = atan(p.y, p.x), r = length(p);",
@@ -262,54 +322,30 @@
     "  }",
     "  return min(d, abs(sdHex(p, 0.16)));",
     "}",
-    "",
-    "// One octave of the atlas. x is in the layer's own units (~1 feature",
-    "// per unit), px is layer units per screen pixel, fillW says how much",
-    "// of the layer's ground fill to show (only once it is large).",
-    "vec4 layer(int fam, vec2 x, float seed, float hue, float px, float fillW, float strW){",
+    "// One texture octave. Returns structure colour and coverage.",
+    "vec4 texLayer(int fam, vec2 x, float seed, float hue, float px){",
     "  vec2 p = x + seed * vec2(13.7, 7.3);",
-    "  float mask = smoothstep(-0.12, 0.22, gnoise(p * 0.17 + seed));",
-    "  vec3 c; float st = 0.0, fl = 0.0;",
-    "",
+    "  vec3 c; float st = 0.0;",
     "  if (fam == 0) {",
-    "    // nebula: domain-warped gas with bright ionisation fronts",
     "    vec2 q = vec2(fbm3(p * 0.8), fbm3(p * 0.8 + vec2(5.2, 1.3)));",
     "    float n = fbm3(p * 0.8 + 2.4 * q + vec2(0.015 * uTime, 0.0));",
-    "    float dens = smoothstep(-0.3, 0.6, n);",
     "    float fil = pow(clamp(1.0 - abs(n - 0.2) * 4.0, 0.0, 1.0), 4.0);",
-    "    c = pal(hue + 0.2 * q.x, 0.2 + 0.7 * dens) + pal(hue + 0.3, 1.0) * fil * 0.5;",
-    "    fl = 0.9 * dens;",
-    "    st = 0.6 * fil;",
+    "    c = pal(hue + 0.2 * q.x, 0.5 + 0.5 * smoothstep(-0.3, 0.6, n)) + pal(hue + 0.3, 1.0) * fil * 0.5;",
+    "    st = 0.25 * smoothstep(-0.3, 0.6, n) + 0.6 * fil;",
     "  } else if (fam == 1) {",
-    "    // relief: coastline, sea depth and contour lines of a terrain",
     "    float h = fbm3(p * 0.55) + 0.35 * fbm3(p * 1.7 + 3.1);",
-    "    float sea = (fract(seed * 0.37) - 0.5) * 0.25;",
-    "    float aah = fwidth(h) * 1.5 + 1e-4;",
-    "    float land = smoothstep(sea - aah, sea + aah, h);",
     "    float ci = h * 7.0;",
     "    float cw = fwidth(ci) + 1e-4;",
-    "    float contour = 1.0 - smoothstep(0.5 * cw, 1.5 * cw, abs(fract(ci + 0.5) - 0.5));",
-    "    float coast = 1.0 - smoothstep(aah, 3.0 * aah, abs(h - sea));",
-    "    vec3 ocean = pal(hue + 0.5, 0.15 + 0.35 * smoothstep(sea - 0.5, sea, h));",
-    "    vec3 earth = pal(hue, 0.35 + 0.6 * smoothstep(sea, sea + 0.6, h));",
-    "    c = mix(ocean, earth, land);",
-    "    c = mix(c, pal(hue + 0.08, 1.0), contour * 0.45 * land);",
-    "    c = mix(c, pal(hue + 0.15, 1.15), coast * 0.8);",
-    "    fl = 0.92;",
-    "    st = max(contour * 0.45 * land, coast);",
+    "    st = 0.6 * (1.0 - smoothstep(0.5 * cw, 1.5 * cw, abs(fract(ci + 0.5) - 0.5)));",
+    "    c = pal(hue + 0.08, 1.0);",
     "  } else if (fam == 2) {",
-    "    // rivers, leaf veins, lightning: ridges of warped noise",
     "    vec2 w = p * 0.7 + 0.9 * vec2(fbm3(p * 0.35), fbm3(p * 0.35 + 4.1));",
     "    float n1 = gnoise(w), n2 = gnoise(w * 2.3 + 1.7);",
     "    float r1 = 1.0 - smoothstep(0.0, fwidth(n1) * 1.2 + 0.025, abs(n1));",
     "    float r2 = (1.0 - smoothstep(0.0, fwidth(n2) * 1.2 + 0.015, abs(n2))) * (1.0 - smoothstep(0.0, 0.4, abs(n1)));",
-    "    float halo = exp(-abs(n1) * 9.0);",
-    "    float k = clamp(r1 + 0.8 * r2 + 0.3 * halo, 0.0, 1.0);",
-    "    c = mix(pal(hue, 0.1), pal(hue, 1.0), k);",
-    "    fl = 0.4 + 0.3 * halo;",
-    "    st = k;",
+    "    st = clamp(r1 + 0.8 * r2 + 0.25 * exp(-abs(n1) * 9.0), 0.0, 1.0);",
+    "    c = pal(hue, 1.0);",
     "  } else if (fam == 3) {",
-    "    // tissue, cracked mud, basalt: Voronoi cells with nuclei",
     "    vec2 id, rc;",
     "    vec3 v = voro(p * 1.1, id, rc);",
     "    float e = v.y - v.x;",
@@ -317,18 +353,13 @@
     "    float ew = 0.05 + px * 1.8;",
     "    float edge = 1.0 - smoothstep(ew * 0.5, ew, e);",
     "    float nuc = (1.0 - smoothstep(0.07, 0.07 + px * 2.2, length(rc))) * step(0.35, h);",
-    "    vec3 body = pal(hue + 0.1 * h, 0.22 + 0.35 * h) * (0.6 + 0.4 * smoothstep(0.0, 0.4, e));",
-    "    c = mix(body, pal(hue + 0.05, 0.95), edge);",
-    "    c = mix(c, pal(hue + 0.45, 0.9), nuc);",
-    "    fl = 0.85;",
+    "    c = mix(pal(hue + 0.05, 0.95), pal(hue + 0.45, 0.9), nuc);",
     "    st = max(edge, nuc);",
     "  } else if (fam == 4) {",
-    "    // starfield with the occasional spiral galaxy",
     "    vec2 id, rc;",
     "    voro(p * 1.4, id, rc);",
     "    float h = hash12(id + seed), h2 = hash12(id * 1.37 + seed + 3.1);",
-    "    float pv = px * 1.4;",
-    "    float sz = max(pv * 1.4, 0.02);",
+    "    float sz = max(px * 2.0, 0.02);",
     "    float b = pow(h, 4.0) * (0.75 + 0.25 * sin(uTime * 1.7 + h * 60.0));",
     "    float star = b / (1.0 + dot(rc, rc) / (sz * sz));",
     "    float gal = 0.0;",
@@ -342,12 +373,9 @@
     "      gal = exp(-rr * 3.2) * (0.3 + 0.9 * arms * arms * arms) + 1.4 * exp(-rr * rr * 40.0);",
     "      gal *= 1.0 - smoothstep(0.6, 1.1, rr);",
     "    }",
-    "    float dust = smoothstep(0.0, 0.8, fbm3(p * 0.4));",
-    "    c = pal(hue + 0.55, 0.04 + 0.2 * dust) + pal(hue + 0.1 * h, 1.0) * star + pal(hue + 0.15, 0.9) * gal;",
-    "    fl = 0.55 + 0.3 * dust;",
+    "    c = pal(hue + 0.1 * h, 1.0);",
     "    st = clamp(star + gal, 0.0, 1.0);",
     "  } else if (fam == 5) {",
-    "    // frost: snow crystals of varying symmetry scattered on ice",
     "    vec2 id, rc;",
     "    voro(p * 0.9, id, rc);",
     "    float h = hash12(id + seed), h2 = hash12(id * 2.1 + seed);",
@@ -358,52 +386,145 @@
     "    float pv = px * 0.9;",
     "    float w = 0.01 + pv * 0.6;",
     "    float on = step(0.3, h);",
-    "    float core = (1.0 - smoothstep(w, w + pv * 1.5, d)) * on;",
-    "    float halo = exp(-d / (0.03 + pv * 2.0)) * 0.5 * on;",
-    "    float frost = smoothstep(0.0, 0.7, fbm3(p * 1.3));",
-    "    float k2 = clamp(core + halo, 0.0, 1.0);",
-    "    c = mix(pal(hue + 0.55, 0.1 + 0.22 * frost), pal(hue, 1.0), k2);",
-    "    fl = 0.5 + 0.3 * frost;",
-    "    st = k2;",
+    "    st = clamp((1.0 - smoothstep(w, w + pv * 1.5, d)) * on + exp(-d / (0.03 + pv * 2.0)) * 0.5 * on, 0.0, 1.0);",
+    "    c = pal(hue, 1.0);",
     "  } else {",
-    "    // currents: banded flow, like gas-giant belts or wind on dunes",
     "    vec2 w = p * 0.6 + 1.3 * vec2(fbm3(p * 0.3 + 1.0), fbm3(p * 0.3 + 5.7));",
     "    float band = w.y * 1.8 + 1.2 * fbm3(w * 0.8);",
     "    float bw = fwidth(band) + 1e-4;",
-    "    float s = 0.5 + 0.5 * sin(band * TAU);",
-    "    float line = 1.0 - smoothstep(0.6 * bw, 1.8 * bw + 0.01, abs(fract(band + 0.5) - 0.5));",
-    "    c = pal(hue + 0.08 * sin(band * 1.7), 0.22 + 0.55 * s);",
-    "    c = mix(c, pal(hue + 0.2, 1.0), line * 0.7);",
-    "    fl = 0.8;",
-    "    st = line * 0.7;",
+    "    st = 0.7 * (1.0 - smoothstep(0.6 * bw, 1.8 * bw + 0.01, abs(fract(band + 0.5) - 0.5)));",
+    "    c = pal(hue + 0.2, 1.0);",
     "  }",
-    "",
-    "  // ground fills sit in shadow so the structures read above them",
-    "  c *= mix(0.5, 1.0, clamp(st, 0.0, 1.0));",
-    "  float a = clamp(st * strW * (0.15 + 0.85 * mask) + fl * fillW * mask, 0.0, 1.0);",
-    "  return vec4(c, a);",
+    "  return vec4(c, st);",
     "}",
     "",
     "void main(){",
     "  float pxs = 2.0 / min(uRes.x, uRes.y);",
     "  vec2 s = (gl_FragCoord.xy - 0.5 * uRes) * pxs;",
-    "  vec3 col = pal(uBgHue, 0.03);",
+    "",
+    "  // folded coarse octaves: a quadratic patch around the screen centre",
+    "  float F = uP.x + dot(uP.yz, s) + 0.5 * (uPM.x * s.x * s.x + 2.0 * uPM.y * s.x * s.y + uPM.z * s.y * s.y);",
+    "  vec2 gF = uP.yz + vec2(uPM.x * s.x + uPM.y * s.y, uPM.y * s.x + uPM.z * s.y);",
+    "  float Q = uQ.x + dot(uQ.yz, s) + 0.5 * (uQM.x * s.x * s.x + 2.0 * uQM.y * s.x * s.y + uQM.z * s.y * s.y);",
+    "",
     "  for (int k = 0; k < N; k++) {",
     "    float u = uU[k];",
-    "    float scale = uF * exp2(u);",
-    "    float px = scale * pxs;",
-    "    // leave as the layer outgrows the screen, arrive gently at the",
-    "    // fine end, and never draw a layer whose features are sub-pixel",
-    "    float wt = smoothstep(-1.0, -0.4, u)",
-    "             * (1.0 - smoothstep(float(N) - 2.5, float(N) - 1.0, u))",
-    "             * (1.0 - smoothstep(0.05, 0.16, px));",
-    "    if (wt < 0.002) continue;",
-    "    vec2 x = mat2(uR[k].x, uR[k].y, -uR[k].y, uR[k].x) * (s * scale) + uC[k];",
-    "    // big layers carry the composition; fine ones only whisper detail",
-    "    float fillW = 1.0 - smoothstep(0.0, 1.6, u);",
-    "    float strW = 1.0 - 0.75 * smoothstep(0.4, 3.5, u);",
-    "    vec4 L = layer(int(uFam[k] + 0.5), x, uSeed[k], uHue[k], px, fillW, strW);",
-    "    col = mix(col, L.rgb, L.a * wt);",
+    "    float sc = uB * exp2(u);",
+    "    mat2 R = mat2(uR[k].x, uR[k].y, -uR[k].y, uR[k].x);",
+    "    vec2 lp = uCf[k] + R * (s * sc);",
+    "    // new octaves grow in at the fine end, and nothing sub-pixel is drawn",
+    "    float w = (1.0 - smoothstep(KF - 1.0, KF, u)) * (1.0 - smoothstep(0.3, 0.6, sc * pxs));",
+    "    float amp = w * exp2(u * uLogA);",
+    "    vec3 n = noised(uCi[k], lp, uSeed[k]);",
+    "    F += amp * n.x;",
+    "    gF += amp * sc * (transpose(R) * n.yz);",
+    "    Q += w * QA * noised(uCi[k], lp, uSeed[k] ^ 0x9e3779b9u).x;",
+    "  }",
+    "",
+    "  float fw = max(length(gF) * pxs, 1e-6);   // field change per pixel",
+    "  float land = smoothstep(-0.8 * fw, 0.8 * fw, F);",
+    "",
+    "  // hill shading from the analytic gradient",
+    "  vec3 nrm = normalize(vec3(-gF * 0.055, 1.0));",
+    "  float shade = clamp(dot(nrm, normalize(vec3(-0.55, 0.6, 0.58))), 0.0, 1.0);",
+    "",
+    "  vec3 earth = pal(Q, 0.28 + 0.42 * (0.5 + 0.5 * tanh(F * 0.12))) * (0.4 + 0.8 * shade);",
+    "  vec3 sea = pal(Q + 0.47, 0.05 + 0.26 * exp(min(F, 0.0) * 0.22)) * (0.82 + 0.3 * shade);",
+    "  vec3 col = mix(sea, earth, land);",
+    "",
+    "  if (uTex > 0.005) {",
+    "    float hueT = Q + mix(0.47, 0.0, land);",
+    "    for (int k = 0; k < N; k++) {",
+    "      float u = uU[k];",
+    "      float sc = uB * exp2(u);",
+    "      float px = sc * pxs;",
+    "      float tw = smoothstep(-3.0, -1.6, u) * (1.0 - smoothstep(KF - 2.2, KF - 1.0, u)) * (1.0 - smoothstep(0.05, 0.16, px));",
+    "      if (tw < 0.01) continue;",
+    "      mat2 R = mat2(uR[k].x, uR[k].y, -uR[k].y, uR[k].x);",
+    "      vec2 x = vec2(uCi[k] - ivec2(" + COORD0 + ")) + uCf[k] + R * (s * sc);",
+    "      vec4 L = texLayer(int(uFam[k] + 0.5), x, uTSeed[k], hueT, px);",
+    "      col = mix(col, L.rgb * mix(0.55, 1.0, land), clamp(L.a, 0.0, 1.0) * tw * uTex * mix(0.45, 0.8, land));",
+    "    }",
+    "  }",
+    "",
+    "  // Contour tiers. Level spacing doubles from tier to tier in world",
+    "  // height, so every coarse line is also a line of every finer tier:",
+    "  // lines never vanish, they gain new neighbours as you descend.",
+    "  float lines = 0.0;",
+    "  for (int m = -3; m <= 5; m++) {",
+    "    float e = uEfr + float(m);",
+    "    float sp = exp2(e);",
+    "    float vis = smoothstep(5.0, 12.0, sp / fw) * (1.0 - smoothstep(5.0, 6.0, e));",
+    "    if (vis <= 0.0) continue;",
+    "    float rank = clamp((e + 1.0) / 5.0, 0.0, 1.0);",
+    "    float d = abs(F - sp * floor(F / sp + 0.5)) / fw;",
+    "    float wpx = 0.5 + 0.9 * rank;",
+    "    lines = max(lines, vis * (1.0 - smoothstep(wpx - 0.7, wpx + 0.7, d)) * (0.2 + 0.6 * rank));",
+    "  }",
+    "  col = mix(col, mix(pal(Q + 0.5, 0.75), pal(Q + 0.08, 1.05), land), lines * mix(0.55, 0.8, land));",
+    "",
+    "  // the coastline itself: the one line that is there at every depth",
+    "  float ad = abs(F) / fw;",
+    "  col += pal(Q + 0.14, 1.0) * exp(-ad / 14.0) * 0.22;",
+    "  col = mix(col, pal(Q + 0.14, 1.25), 1.0 - smoothstep(0.8, 2.0, ad));",
+    "",
+    "  col *= 1.0 - 0.3 * smoothstep(0.6, 1.9, length(s));",
+    "  fragColor = vec4(pow(max(col, 0.0), vec3(0.95)) * uFade, 1.0);",
+    "}"
+  ].join("\n");
+
+  /* ------------------------------------------------------------------ *
+   * Julia spiral. For f(z) = z^2 + c with a repelling fixed point a and
+   * multiplier L = f'(a), the Poincare function P(w) = lim f^n(a + w/L^n)
+   * satisfies P(L w) = f(P(w)). Zooming in by |L| therefore shows the
+   * very same picture, turned by arg L, one iteration deeper. Rendering
+   * P instead of the plane gives an exact, seamless and truly endless
+   * zoom with nothing but small numbers on the GPU.
+   * ------------------------------------------------------------------ */
+
+  var JULIA_FRAG = [
+    "#version 300 es",
+    "precision highp float;",
+    "precision highp int;",
+    COMMON,
+    "out vec4 fragColor;",
+    "uniform vec2 uRes;",
+    "uniform float uFade, uPx, uHue, uHueOff, uBandOff;",
+    "uniform vec2 uC, uZ, uL, uW, uLn;",
+    "uniform int uN;",
+    "vec2 cmul(vec2 a, vec2 b){ return vec2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x); }",
+    "void main(){",
+    "  float pxs = 2.0 / min(uRes.x, uRes.y);",
+    "  vec2 s = (gl_FragCoord.xy - 0.5 * uRes) * pxs;",
+    "  vec2 w = cmul(s, uW);",
+    "  // perturbation around the fixed point: d' = L d + d^2",
+    "  vec2 d = cmul(w, uLn), dd = uLn;",
+    "  for (int i = 0; i < 400; i++) {",
+    "    if (i >= uN) break;",
+    "    dd = cmul(uL + 2.0 * d, dd);",
+    "    d = cmul(uL, d) + cmul(d, d);",
+    "  }",
+    "  vec2 z = uZ + d, dz = dd;",
+    "  float it = 0.0; bool esc = false;",
+    "  for (int i = 0; i < 600; i++) {",
+    "    if (dot(z, z) > 1024.0) { esc = true; break; }",
+    "    dz = 2.0 * cmul(z, dz);",
+    "    z = cmul(z, z) + uC;",
+    "    it += 1.0;",
+    "  }",
+    "  vec3 col;",
+    "  if (esc) {",
+    "    float r2 = dot(z, z);",
+    "    float mu = it - log2(0.5 * log2(r2));",
+    "    float de = 0.25 * sqrt(r2) * log(r2) / max(length(dz), 1e-30);",
+    "    float dp = de / uPx;",
+    "    float band = 0.5 + 0.5 * cos(mu * 0.35 + uBandOff);",
+    "    float h = uHue + uHueOff + 0.045 * mu;",
+    "    col = pal(h, 0.08 + 0.3 * band) * (0.35 + 0.65 * smoothstep(0.0, 40.0, dp))",
+    "        + pal(h + 0.08, 1.1) * exp(-dp / 2.0) * 0.9",
+    "        + pal(h + 0.04, 0.8) * exp(-dp / 14.0) * 0.25;",
+    "  } else {",
+    "    col = pal(uHue + uHueOff + 0.5, 0.06);",
     "  }",
     "  col *= 1.0 - 0.3 * smoothstep(0.6, 1.9, length(s));",
     "  fragColor = vec4(pow(max(col, 0.0), vec3(0.95)) * uFade, 1.0);",
@@ -420,61 +541,246 @@
     return sh;
   }
 
-  var prog = gl.createProgram();
-  gl.attachShader(prog, compile(gl.VERTEX_SHADER, VERT));
-  gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FRAG));
-  gl.linkProgram(prog);
-  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
-    throw new Error(gl.getProgramInfoLog(prog) || "program link failed");
+  function program(fragSrc, names) {
+    var p = gl.createProgram();
+    gl.attachShader(p, compile(gl.VERTEX_SHADER, VERT));
+    gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fragSrc));
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+      throw new Error(gl.getProgramInfoLog(p) || "program link failed");
+    }
+    var U = {};
+    names.forEach(function (n) { U[n] = gl.getUniformLocation(p, n); });
+    return { prog: p, U: U };
   }
-  gl.useProgram(prog);
 
-  var U = {};
-  ["uRes", "uTime", "uFade", "uF", "uBgHue", "uU", "uC", "uR", "uFam", "uSeed", "uHue"].forEach(function (n) {
-    U[n] = gl.getUniformLocation(prog, n);
-  });
+  var fieldProg = program(FIELD_FRAG, ["uRes", "uTime", "uFade", "uB", "uLogA", "uEfr", "uTex",
+    "uU", "uCi", "uCf", "uR", "uSeed", "uFam", "uTSeed", "uP", "uPM", "uQ", "uQM"]);
+  var juliaProg = program(JULIA_FRAG, ["uRes", "uFade", "uPx", "uHue", "uHueOff", "uBandOff",
+    "uC", "uZ", "uL", "uW", "uLn", "uN"]);
 
   /* ------------------------------------------------------------------ *
-   * Layers.
+   * The fractal field, mirrored on the CPU.
    * ------------------------------------------------------------------ */
 
-  var levels = new Map();
-  var depth = 0; // continuous zoom depth, in octaves (one octave = 2x)
+  var HG = [0, 0];
+  function hgrad(ix, iy, seed) {
+    var x = (ix + seed) >>> 0;
+    var y = (iy + Math.imul(seed, 747796405)) >>> 0;
+    x = (Math.imul(x, 1664525) + 1013904223) >>> 0;
+    y = (Math.imul(y, 1664525) + 1013904223) >>> 0;
+    x = (x + Math.imul(y, 1664525)) >>> 0;
+    y = (y + Math.imul(x, 1664525)) >>> 0;
+    x = (x ^ (x >>> 16)) >>> 0; y = (y ^ (y >>> 16)) >>> 0;
+    x = (x + Math.imul(y, 1664525)) >>> 0;
+    y = (y + Math.imul(x, 1664525)) >>> 0;
+    x = (x ^ (x >>> 16)) >>> 0; y = (y ^ (y >>> 16)) >>> 0;
+    HG[0] = x * 4.656612873077393e-10 - 1;
+    HG[1] = y * 4.656612873077393e-10 - 1;
+  }
+
+  // Value and gradient of the noise at absolute layer coordinates.
+  function noised(px, py, seed, out) {
+    var ix = Math.floor(px), iy = Math.floor(py), fx = px - ix, fy = py - iy;
+    var ux = fx * fx * fx * (fx * (fx * 6 - 15) + 10), uy = fy * fy * fy * (fy * (fy * 6 - 15) + 10);
+    var dux = 30 * fx * fx * (fx * (fx - 2) + 1), duy = 30 * fy * fy * (fy * (fy - 2) + 1);
+    hgrad(ix, iy, seed); var gax = HG[0], gay = HG[1];
+    hgrad(ix + 1, iy, seed); var gbx = HG[0], gby = HG[1];
+    hgrad(ix, iy + 1, seed); var gcx = HG[0], gcy = HG[1];
+    hgrad(ix + 1, iy + 1, seed); var gdx = HG[0], gdy = HG[1];
+    var va = gax * fx + gay * fy;
+    var vb = gbx * (fx - 1) + gby * fy;
+    var vc = gcx * fx + gcy * (fy - 1);
+    var vd = gdx * (fx - 1) + gdy * (fy - 1);
+    var k0 = va - vb - vc + vd;
+    out[0] = 1.4 * (va + ux * (vb - va) + uy * (vc - va) + ux * uy * k0);
+    out[1] = 1.4 * (gax + ux * (gbx - gax) + uy * (gcx - gax) + ux * uy * (gax - gbx - gcx + gdx) + dux * (uy * k0 + vb - va));
+    out[2] = 1.4 * (gay + ux * (gby - gay) + uy * (gcy - gay) + ux * uy * (gay - gby - gcy + gdy) + duy * (ux * k0 + vc - va));
+  }
+
+  function smooth(a, b, x) { var t = Math.min(1, Math.max(0, (x - a) / (b - a))); return t * t * (3 - 2 * t); }
+
+  var field = {
+    levels: new Map(),
+    d: 0,                              // depth in octaves
+    P: new Float64Array(6),            // folded height: value, grad x/y, Hxx, Hxy, Hyy
+    Q: new Float64Array(6),            // folded hue, same layout
+    runFam: -1, runUntil: -1e9,        // texture family runs across octaves
+    tx: 1, ty: 0                       // heading along the coast
+  };
+
+  var NB = [0, 0, 0];
+  // One layer's noise at screen point (sx, sy): value and screen gradient.
+  function layerAt(lv, u, sx, sy, seed, out) {
+    var sc = BASE_FREQ * Math.pow(2, u);
+    var vx = (lv.cs * sx - lv.sn * sy) * sc, vy = (lv.sn * sx + lv.cs * sy) * sc;
+    noised(lv.cx + vx, lv.cy + vy, seed, NB);
+    out[0] = NB[0];
+    out[1] = sc * (lv.cs * NB[1] + lv.sn * NB[2]);
+    out[2] = sc * (-lv.sn * NB[1] + lv.cs * NB[2]);
+  }
+
+  function taylorAt(T, sx, sy, out) {
+    out[0] = T[0] + T[1] * sx + T[2] * sy + 0.5 * (T[3] * sx * sx + 2 * T[4] * sx * sy + T[5] * sy * sy);
+    out[1] = T[1] + T[3] * sx + T[4] * sy;
+    out[2] = T[2] + T[4] * sx + T[5] * sy;
+  }
+
+  // Normalised height at a screen point. With steer set, octaves finer
+  // than the screen are left out so the camera follows the coast's
+  // overall course instead of every tiny wiggle.
+  var LA = [0, 0, 0];
+  function evalField(sx, sy, steer, out) {
+    taylorAt(field.P, sx, sy, out);
+    var n = Math.floor(field.d);
+    for (var L = n - KC; L <= n + KF; L++) {
+      var lv = field.levels.get(L), u = L - field.d;
+      var w = (1 - smooth(KF - 1, KF, u)) * (steer ? 1 - smooth(0, 1.5, u) : 1);
+      if (w <= 0) continue;
+      var amp = w * Math.pow(A, u);
+      layerAt(lv, u, sx, sy, lv.seed, LA);
+      out[0] += amp * LA[0]; out[1] += amp * LA[1]; out[2] += amp * LA[2];
+    }
+    return out;
+  }
+
+  // Fold a layer that has grown far past the screen into a Taylor patch.
+  var FA = [0, 0, 0], FB = [0, 0, 0];
+  function foldInto(T, lv, u, seed, amp) {
+    var h = 0.5;
+    layerAt(lv, u, 0, 0, seed, FA);
+    T[0] += amp * FA[0]; T[1] += amp * FA[1]; T[2] += amp * FA[2];
+    layerAt(lv, u, h, 0, seed, FA); layerAt(lv, u, -h, 0, seed, FB);
+    var hxx = (FA[1] - FB[1]) / (2 * h), hxy1 = (FA[2] - FB[2]) / (2 * h);
+    layerAt(lv, u, 0, h, seed, FA); layerAt(lv, u, 0, -h, seed, FB);
+    var hyy = (FA[2] - FB[2]) / (2 * h), hxy2 = (FA[1] - FB[1]) / (2 * h);
+    T[3] += amp * hxx; T[4] += amp * 0.5 * (hxy1 + hxy2); T[5] += amp * hyy;
+  }
 
   function newLevel(L) {
-    var prev = levels.get(L - 1), prev2 = levels.get(L - 2);
-    var fam;
-    do { fam = Math.floor(Math.random() * FAMILIES.length); }
-    while ((prev && fam === prev.fam) || (prev2 && fam === prev2.fam));
-    // Hue takes a random walk from one octave to the next, with the
-    // occasional leap into a new colour world.
-    var hue = prev ? prev.hue + (Math.random() - 0.5) * 0.2 : Math.random();
-    if (prev && Math.random() < 0.15) hue += 0.25 + Math.random() * 0.5;
-    hue -= Math.floor(hue);
+    if (L >= field.runUntil) {
+      var fam;
+      do { fam = Math.floor(Math.random() * FAMILIES.length); } while (fam === field.runFam);
+      field.runFam = fam;
+      field.runUntil = L + 4 + Math.floor(Math.random() * 5);
+    }
     var ang = Math.random() * Math.PI * 2;
     return {
-      fam: fam, seed: Math.random() * 64, hue: hue,
       cs: Math.cos(ang), sn: Math.sin(ang),
-      cx: 16 + Math.random() * 96, cy: 16 + Math.random() * 96
+      cx: COORD0 + Math.random() * 1024, cy: COORD0 + Math.random() * 1024,
+      seed: Math.floor(Math.random() * 4294967296) >>> 0,
+      fam: field.runFam, tseed: Math.random() * 64
     };
   }
 
   function syncLevels() {
-    var n = Math.floor(depth);
-    levels.forEach(function (_, L) { if (L < n) levels.delete(L); });
-    for (var L = n; L < n + N; L++) {
-      if (!levels.has(L)) levels.set(L, newLevel(L));
+    var n = Math.floor(field.d);
+    field.levels.forEach(function (lv, L) {
+      if (L < n - KC) {
+        var u = L - field.d;
+        foldInto(field.P, lv, u, lv.seed, Math.pow(A, u));
+        foldInto(field.Q, lv, u, (lv.seed ^ 0x9e3779b9) >>> 0, QA);
+        field.levels.delete(L);
+      }
+    });
+    for (var L = n - KC; L <= n + KF; L++) {
+      if (!field.levels.has(L)) field.levels.set(L, newLevel(L));
     }
   }
 
-  // Move the camera by (dx, dy) screen units: every layer shifts by the
-  // same screen distance, expressed in its own rotated, scaled frame.
-  function pan(dx, dy) {
-    levels.forEach(function (lv, L) {
-      var sc = BASE_FREQ * Math.pow(2, L - depth);
+  function shiftTaylor(T, dx, dy) {
+    T[0] += T[1] * dx + T[2] * dy + 0.5 * (T[3] * dx * dx + 2 * T[4] * dx * dy + T[5] * dy * dy);
+    T[1] += T[3] * dx + T[4] * dy;
+    T[2] += T[4] * dx + T[5] * dy;
+  }
+
+  // Move the camera by (dx, dy) screen units.
+  function panField(dx, dy) {
+    field.levels.forEach(function (lv, L) {
+      var sc = BASE_FREQ * Math.pow(2, L - field.d);
       lv.cx += (lv.cs * dx - lv.sn * dy) * sc;
       lv.cy += (lv.sn * dx + lv.cs * dy) * sc;
     });
+    shiftTaylor(field.P, dx, dy);
+    shiftTaylor(field.Q, dx, dy);
+    field.Q[0] -= Math.floor(field.Q[0]);
+  }
+
+  // Zoom in by dz octaves around the screen centre.
+  function zoomField(dz) {
+    if (dz <= 0) return;
+    field.d += dz;
+    var a = Math.pow(A, -dz), g = Math.pow(2, -dz), P = field.P, Q = field.Q;
+    P[0] *= a; P[1] *= a * g; P[2] *= a * g; P[3] *= a * g * g; P[4] *= a * g * g; P[5] *= a * g * g;
+    Q[1] *= g; Q[2] *= g; Q[3] *= g * g; Q[4] *= g * g; Q[5] *= g * g;
+    syncLevels();
+  }
+
+  // Keep the screen centre on the coastline and drift along it.
+  var EV = [0, 0, 0];
+  function steer(dt, sp) {
+    evalField(0, 0, true, EV);
+    var T = EV[0], gx = EV[1], gy = EV[2];
+    var g2 = gx * gx + gy * gy + 1e-9, gl = Math.sqrt(g2);
+    var tx = -gy / gl, ty = gx / gl;
+    if (tx * field.tx + ty * field.ty < 0) { tx = -tx; ty = -ty; }
+    // turn the heading gently so the drift never jerks
+    var k = Math.min(1, dt * 1.5);
+    field.tx += (tx - field.tx) * k; field.ty += (ty - field.ty) * k;
+    var hl = Math.hypot(field.tx, field.ty) || 1;
+    field.tx /= hl; field.ty /= hl;
+    var vt = 0.32 * sp + 0.012;
+    var pull = Math.min(1, dt * 2.5);
+    var dx = -T * gx / g2 * pull + field.tx * vt * dt;
+    var dy = -T * gy / g2 * pull + field.ty * vt * dt;
+    var m = Math.hypot(dx, dy), lim = (0.25 + 1.2 * sp) * dt;
+    if (m > lim) { dx *= lim / m; dy *= lim / m; }
+    panField(dx, dy);
+  }
+
+  function initField() {
+    field.levels.clear();
+    field.d = 0;
+    field.P.fill(0); field.Q.fill(0);
+    field.Q[0] = Math.random();
+    field.runFam = -1; field.runUntil = -1e9;
+    var a = Math.random() * Math.PI * 2;
+    field.tx = Math.cos(a); field.ty = Math.sin(a);
+    syncLevels();
+    // The folded remainder is an arbitrary constant: pick it so that the
+    // view opens right on a coast.
+    evalField(0, 0, true, EV);
+    field.P[0] -= EV[0];
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Julia state.
+   * ------------------------------------------------------------------ */
+
+  var julia = { D: 0, m: 0 };
+  var SIGMA0 = 0.2;
+
+  function gcd(a, b) { while (b) { var t = a % b; a = b; b = t; } return a; }
+
+  function newJulia() {
+    // A multiplier just outside the main cardioid at a rational angle
+    // p/q lands in the p/q bulb: q arms meeting at the fixed point.
+    var q = 3 + Math.floor(Math.random() * 7), p;
+    do { p = 1 + Math.floor(Math.random() * (q - 1)); } while (gcd(p, q) !== 1);
+    var turn = p / q; if (turn > 0.5) turn -= 1;
+    turn += (Math.random() - 0.5) * 0.012;
+    var th = turn * Math.PI * 2, r = 1.06 + Math.random() * 0.14;
+    var lx = r * Math.cos(th), ly = r * Math.sin(th);
+    var ax = lx / 2, ay = ly / 2;               // fixed point a = L / 2
+    julia.L = [lx, ly]; julia.r = r; julia.th = th; julia.q = q; julia.p = p;
+    julia.Z = [ax, ay];
+    julia.C = [ax - (ax * ax - ay * ay), ay - 2 * ax * ay]; // c = a - a^2
+    // perturbation steps so the seed offset is tiny before iterating
+    julia.n = Math.min(400, Math.ceil(Math.log(SIGMA0 * 2.5 / 1e-4) / Math.log(r)));
+    var rn = Math.pow(r, -julia.n), an = -julia.n * th;
+    julia.Ln = [rn * Math.cos(an), rn * Math.sin(an)];
+    julia.hue = Math.random();
+    julia.D = 0; julia.m = 0;
   }
 
   /* ------------------------------------------------------------------ *
@@ -489,17 +795,25 @@
   var strataEl = document.getElementById("strata");
   var readoutEl = document.getElementById("readout");
   var barEl = document.getElementById("bar");
+  var modelEl = document.getElementById("model");
 
   if (reduced) { speedEl.value = "110"; }
 
   var MAX_RATE = 0.8; // octaves per second at the top of the slider
 
+  var saved = null;
+  try { saved = localStorage.getItem("infinite-atlas:model"); } catch (e) { /* storage unavailable */ }
+  var startModel = MODELS[saved] ? saved : "relief";
+  modelEl.value = startModel;
+
   var state = {
     time: 0,
     paused: false,
-    heading: Math.random() * Math.PI * 2,
+    model: startModel,        // what is on screen
+    tex: startModel === "textured" ? 1 : 0,
     fade: 1,
-    reseedT: -1 // progress of a "new world" transition, -1 when idle
+    transT: -1,               // progress of a fade-through-dark, -1 when idle
+    transAction: null
   };
 
   function speed() {
@@ -521,19 +835,62 @@
     return (m / Math.pow(10, e)).toFixed(1) + "e" + e;
   }
 
+  function octaves() {
+    return state.model === "julia" ? (julia.m + julia.D) * Math.log2(julia.r) : field.d;
+  }
+
+  function fmtC(x, y) {
+    return x.toFixed(3) + (y < 0 ? " − " : " + ") + Math.abs(y).toFixed(3) + "i";
+  }
+
   function describe() {
-    var n = Math.floor(depth);
-    scaleEl.innerHTML = "Magnification <b>" + fmtMag(Math.pow(2, depth)) + "×</b> · octave <b>" + n + "</b>";
-    var names = [];
-    for (var L = n; L < n + N; L++) {
-      var u = L - depth;
-      if (u > -0.6 && u < 2.6) {
-        var name = FAMILIES[levels.get(L).fam];
+    var d = octaves();
+    scaleEl.innerHTML = "Magnification <b>" + fmtMag(Math.pow(2, d)) + "×</b> · octave <b>" + Math.floor(d) + "</b>";
+    if (state.model === "julia") {
+      strataEl.textContent = "c = " + fmtC(julia.C[0], julia.C[1]) + " · " + julia.q + " arms · turns " +
+        Math.round(julia.th * 180 / Math.PI) + "° per " + julia.r.toFixed(2) + "×";
+    } else if (state.model === "textured") {
+      var names = [], n = Math.floor(field.d);
+      for (var L = n; L <= n + 3; L++) {
+        var name = FAMILIES[field.levels.get(L).fam];
         if (names.indexOf(name) < 0) names.push(name);
       }
+      strataEl.textContent = "Coastline › contours › " + names.join(" › ");
+    } else {
+      strataEl.textContent = "Coastline › contours › relief";
     }
-    strataEl.textContent = "Strata " + names.join(" › ");
   }
+
+  // Fade through dark, run action at the darkest point.
+  function transition(action) {
+    if (state.transT >= 0) { state.transAction = action; return; }
+    state.transT = 0;
+    state.transAction = action;
+    wake();
+  }
+
+  function reseed() {
+    transition(function () {
+      if (state.model === "julia") newJulia(); else initField();
+    });
+  }
+
+  function setModel(m) {
+    if (!MODELS[m]) return;
+    modelEl.value = m;
+    try { localStorage.setItem("infinite-atlas:model", m); } catch (e) { /* storage unavailable */ }
+    var fieldNow = state.model !== "julia", fieldNext = m !== "julia";
+    if (fieldNow && fieldNext) {
+      // Same world, textures just fade in or out.
+      state.model = m;
+    } else {
+      transition(function () { state.model = m; state.tex = m === "textured" ? 1 : 0; });
+    }
+    describe();
+    wake();
+  }
+
+  modelEl.addEventListener("change", function () { setModel(modelEl.value); });
 
   speedEl.addEventListener("input", function () {
     state.paused = false;
@@ -541,15 +898,17 @@
     wake();
   });
 
-  function reseed() {
-    if (state.reseedT < 0) state.reseedT = 0;
-    wake();
-  }
   document.getElementById("reseed").addEventListener("click", reseed);
 
   window.addEventListener("keydown", function (e) {
+    var typing = e.target && /^(INPUT|BUTTON|TEXTAREA|SELECT)$/.test(e.target.tagName);
     if (e.code === "KeyR") { reseed(); return; }
-    if (e.code === "Space" && !(e.target && /^(INPUT|BUTTON|TEXTAREA)$/.test(e.target.tagName))) {
+    if (e.code === "KeyM" && !typing) {
+      var keys = Object.keys(MODELS);
+      setModel(keys[(keys.indexOf(modelEl.value) + 1) % keys.length]);
+      return;
+    }
+    if (e.code === "Space" && !typing) {
       e.preventDefault();
       state.paused = !state.paused;
       showRate();
@@ -606,39 +965,78 @@
     var ms = perf.acc / perf.frames * 1000;
     perf.acc = 0; perf.frames = 0;
     var next = renderScale;
-    if (ms > 30 && renderScale > 0.45) next = renderScale * 0.85;
+    if (ms > 30 && renderScale > 0.4) next = renderScale * 0.85;
     else if (ms < 15 && renderScale < 1) next = Math.min(1, renderScale * 1.1);
     if (next !== renderScale) { renderScale = next; resize(); }
   }
 
   /* ------------------------------------------------------------------ *
-   * Frame loop.
+   * Upload and draw.
    * ------------------------------------------------------------------ */
 
-  var bufU = new Float32Array(N), bufC = new Float32Array(2 * N), bufR = new Float32Array(2 * N);
-  var bufFam = new Float32Array(N), bufSeed = new Float32Array(N), bufHue = new Float32Array(N);
+  var bufU = new Float32Array(N), bufCi = new Int32Array(2 * N), bufCf = new Float32Array(2 * N);
+  var bufR = new Float32Array(2 * N), bufSeed = new Uint32Array(N);
+  var bufFam = new Float32Array(N), bufTSeed = new Float32Array(N);
 
-  function upload() {
-    var n = Math.floor(depth);
+  function drawField() {
+    var U = fieldProg.U, n = Math.floor(field.d);
+    gl.useProgram(fieldProg.prog);
     for (var k = 0; k < N; k++) {
-      var lv = levels.get(n + k);
-      bufU[k] = n + k - depth;
-      bufC[2 * k] = lv.cx; bufC[2 * k + 1] = lv.cy;
+      var L = n - KC + k, lv = field.levels.get(L);
+      var ix = Math.floor(lv.cx), iy = Math.floor(lv.cy);
+      bufU[k] = L - field.d;
+      bufCi[2 * k] = ix; bufCi[2 * k + 1] = iy;
+      bufCf[2 * k] = lv.cx - ix; bufCf[2 * k + 1] = lv.cy - iy;
       bufR[2 * k] = lv.cs; bufR[2 * k + 1] = lv.sn;
-      bufFam[k] = lv.fam; bufSeed[k] = lv.seed; bufHue[k] = lv.hue;
+      bufSeed[k] = lv.seed; bufFam[k] = lv.fam; bufTSeed[k] = lv.tseed;
     }
+    var P = field.P, Q = field.Q;
+    var efr = field.d * -LOG2A; efr -= Math.floor(efr);
     gl.uniform2f(U.uRes, canvas.width, canvas.height);
     gl.uniform1f(U.uTime, state.time);
     gl.uniform1f(U.uFade, state.fade);
-    gl.uniform1f(U.uF, BASE_FREQ);
-    gl.uniform1f(U.uBgHue, levels.get(n).hue + 0.55);
+    gl.uniform1f(U.uB, BASE_FREQ);
+    gl.uniform1f(U.uLogA, LOG2A);
+    gl.uniform1f(U.uEfr, efr);
+    gl.uniform1f(U.uTex, state.tex);
     gl.uniform1fv(U.uU, bufU);
-    gl.uniform2fv(U.uC, bufC);
+    gl.uniform2iv(U.uCi, bufCi);
+    gl.uniform2fv(U.uCf, bufCf);
     gl.uniform2fv(U.uR, bufR);
+    gl.uniform1uiv(U.uSeed, bufSeed);
     gl.uniform1fv(U.uFam, bufFam);
-    gl.uniform1fv(U.uSeed, bufSeed);
-    gl.uniform1fv(U.uHue, bufHue);
+    gl.uniform1fv(U.uTSeed, bufTSeed);
+    gl.uniform3f(U.uP, P[0], P[1], P[2]);
+    gl.uniform3f(U.uPM, P[3], P[4], P[5]);
+    gl.uniform3f(U.uQ, Q[0], Q[1], Q[2]);
+    gl.uniform3f(U.uQM, Q[3], Q[4], Q[5]);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
   }
+
+  function drawJulia() {
+    var U = juliaProg.U;
+    gl.useProgram(juliaProg.prog);
+    var fr = julia.D;
+    var mag = SIGMA0 * Math.pow(julia.r, -fr), ang = -julia.th * fr;
+    var hueOff = julia.m * 0.045, bandOff = julia.m * 0.35;
+    gl.uniform2f(U.uRes, canvas.width, canvas.height);
+    gl.uniform1f(U.uFade, state.fade);
+    gl.uniform1f(U.uPx, mag * 2 / Math.min(canvas.width, canvas.height));
+    gl.uniform1f(U.uHue, julia.hue);
+    gl.uniform1f(U.uHueOff, hueOff - Math.floor(hueOff));
+    gl.uniform1f(U.uBandOff, bandOff % (Math.PI * 2));
+    gl.uniform2f(U.uC, julia.C[0], julia.C[1]);
+    gl.uniform2f(U.uZ, julia.Z[0], julia.Z[1]);
+    gl.uniform2f(U.uL, julia.L[0], julia.L[1]);
+    gl.uniform2f(U.uW, mag * Math.cos(ang), mag * Math.sin(ang));
+    gl.uniform2f(U.uLn, julia.Ln[0], julia.Ln[1]);
+    gl.uniform1i(U.uN, julia.n);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Frame loop.
+   * ------------------------------------------------------------------ */
 
   var last = 0, infoClock = 0;
 
@@ -650,27 +1048,30 @@
 
     var sp = speed();
 
-    // Slow wandering drift across the map while descending.
-    state.heading += (Math.sin(state.time * 0.031) * 0.6 + Math.sin(state.time * 0.017 + 1.3) * 0.4) * 0.08 * dt;
-    var v = 0.35 * sp * dt;
-    pan(Math.cos(state.heading) * v, Math.sin(state.heading) * v);
-
-    depth += sp * dt;
-    syncLevels();
-
-    if (state.reseedT >= 0) {
-      var before = state.reseedT;
-      state.reseedT = Math.min(1, state.reseedT + dt / 2.4);
-      if (before < 0.5 && state.reseedT >= 0.5) {
-        levels.clear();
-        syncLevels();
-      }
-      state.fade = 1 - 0.95 * Math.exp(-Math.pow((state.reseedT - 0.5) / 0.16, 2));
-      if (state.reseedT >= 1) { state.reseedT = -1; state.fade = 1; }
+    if (state.model === "julia") {
+      // D counts multiplier periods; each one is a zoom of |L|.
+      julia.D += sp * dt / Math.log2(julia.r);
+      while (julia.D >= 1) { julia.D -= 1; julia.m += 1; }
+    } else {
+      zoomField(sp * dt);
+      if (!state.paused) steer(dt, sp);
+      var target = state.model === "textured" ? 1 : 0;
+      state.tex += (target - state.tex) * Math.min(1, dt * 1.6);
     }
 
-    upload();
-    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    if (state.transT >= 0) {
+      var before = state.transT;
+      state.transT = Math.min(1, state.transT + dt / 2.0);
+      if (before < 0.5 && state.transT >= 0.5 && state.transAction) {
+        state.transAction();
+        state.transAction = null;
+        describe();
+      }
+      state.fade = 1 - 0.97 * Math.exp(-Math.pow((state.transT - 0.5) / 0.16, 2));
+      if (state.transT >= 1) { state.transT = -1; state.fade = 1; }
+    }
+
+    if (state.model === "julia") drawJulia(); else drawField();
 
     infoClock -= dt;
     if (infoClock <= 0) { infoClock = 0.25; describe(); }
@@ -679,7 +1080,8 @@
     requestAnimationFrame(frame);
   }
 
-  syncLevels();
+  initField();
+  newJulia();
   describe();
   showRate();
   requestAnimationFrame(frame);
